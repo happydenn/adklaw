@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from google.adk.apps import App
 from google.adk.events import Event
@@ -64,6 +66,12 @@ def _id_label(display: str | None, id_: str) -> str:
     return f"{display} (id={id_})" if display else f"id={id_}"
 
 
+# Wire format. The agent-side explanation of these blocks lives with
+# the channel that emits them (e.g. `DISCORD_CHANNEL_INSTRUCTION` in
+# `app/channels/discord.py`), passed into `build_app(extra_instruction=...)`
+# at channel startup. Update both when adding or renaming an envelope.
+
+
 def _format_origin(o: Origin) -> str:
     return (
         "[origin]\n"
@@ -107,7 +115,32 @@ class ChannelBase:
     serialization avoids that without blocking unrelated conversations.
     """
 
-    def __init__(self, app: App, session_service: BaseSessionService):
+    def __init__(
+        self,
+        app: App | None = None,
+        session_service: BaseSessionService | None = None,
+        *,
+        extra_tools: Sequence[Any] = (),
+        extra_instruction: str = "",
+    ):
+        if session_service is None:
+            raise TypeError(
+                "ChannelBase: session_service is required"
+            )
+        if app is None:
+            # Lazy import to avoid pulling Vertex deps when subclasses
+            # are imported in test contexts that stub the runner.
+            from app.agent import build_app
+
+            app = build_app(
+                extra_tools=extra_tools,
+                extra_instruction=extra_instruction,
+            )
+        elif extra_tools or extra_instruction:
+            raise ValueError(
+                "ChannelBase: pass either an explicit App or "
+                "extra_tools/extra_instruction, not both."
+            )
         self._app = app
         self._session_service = session_service
         self._runner = Runner(

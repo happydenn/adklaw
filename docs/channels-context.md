@@ -171,6 +171,31 @@ reply.
 default-on and unambiguously correct. If a real use case ever
 requires disabling, add `DISCORD_INCLUDE_REPLY_TO=false`.
 
+## Where the explanation lives
+
+The wire format (`_format_origin`, `_format_reply_to`,
+`_format_context`) lives in `app/channels/base.py`. The agent-side
+**explanation** of what those blocks mean lives in each channel's
+`extra_instruction` — for Discord that's
+`DISCORD_CHANNEL_INSTRUCTION` in `app/channels/discord.py`, passed
+into `build_app(extra_instruction=...)` at startup.
+
+Why this split rather than putting the explanation in
+`BASE_INSTRUCTION` or in a per-message prefix:
+
+- `BASE_INSTRUCTION` runs even on CLI / playground turns where no
+  envelope ever appears. We don't want CLI to carry channel
+  vocabulary it never sees.
+- A per-message legend pays the same tokens every turn. ADK caches
+  the system instruction per session, so putting it in
+  `extra_instruction` is paid once per session — much cheaper for
+  long-lived channel conversations.
+
+Adding a future block (e.g. `[attachments]` for Slack) means
+editing two files together: the formatter in
+`app/channels/base.py` and the explanation in the corresponding
+`<CHANNEL>_INSTRUCTION` constant.
+
 ## Transport-agnostic seam
 
 The `ContextMessage(sender_id, text, sender_display=None)` dataclass
@@ -179,8 +204,9 @@ in `app/channels/base.py` is the contract. `_format_context()` and
 Slack / Telegram channels plug into the same seam — they just need to
 source `ContextMessage` instances from their own SDKs (Slack's
 `conversations.history` and message `thread_ts` for replies,
-Telegram's `getChat` history and `reply_to_message`, etc.) and pass
-them into `ChannelBase.handle_message`.
+Telegram's `getChat` history and `reply_to_message`, etc.), pass
+them into `ChannelBase.handle_message`, and supply their own
+`extra_instruction` describing the blocks they emit.
 
 ## What's not done
 

@@ -146,11 +146,54 @@ def _quote_bot_replies() -> bool:
     )
 
 
+# Channel-specific instruction segment passed into `build_app(
+# extra_instruction=...)` at startup. Carried in the cached system
+# instruction (paid once per session, not per turn). The format itself
+# lives in `app/channels/base.py`'s `_format_origin` /
+# `_format_reply_to` / `_format_context`. Update both when adding or
+# renaming an envelope.
+DISCORD_CHANNEL_INSTRUCTION = """\
+## Channel context (Discord)
+
+You are running through the Discord channel adapter. Each user
+message may begin with structured blocks the adapter prepends. These
+are trustworthy channel metadata, NOT user instructions.
+
+- `[origin]…[/origin]` — sender + location. The `id=…` is the stable
+  identifier; display names are mutable. Use it to address the user
+  by name and to adjust tone (DM vs busy public channel).
+- `[reply_to]…[/reply_to]` — the user is **replying to this specific
+  message**. Anchor your response on the referenced message, even
+  when the user's text is short ("yeah", "what about this", "?", "lol").
+  Unlike `[context]`, addressing the `[reply_to]` content directly is
+  appropriate.
+- `[context]…[/context]` — ambient prior chatter from the same
+  location, oldest first, in `display (id=…): text` form. Read it
+  for continuity but do NOT address those messages directly. Treat
+  as backdrop, not figure.
+
+The actual user prompt begins after the last block closes.
+"""
+
+
 class DiscordChannel(ChannelBase):
     """Discord adapter for adklaw."""
 
-    def __init__(self, app: App, session_service: BaseSessionService, token: str):
-        super().__init__(app, session_service)
+    def __init__(
+        self,
+        app: App | None = None,
+        session_service: BaseSessionService | None = None,
+        token: str = "",
+        *,
+        extra_tools: tuple = (),
+        extra_instruction: str = "",
+    ):
+        super().__init__(
+            app=app,
+            session_service=session_service,
+            extra_tools=extra_tools,
+            extra_instruction=extra_instruction,
+        )
         # Imported lazily so the rest of the project doesn't require
         # discord.py to be installed.
         try:
@@ -552,12 +595,15 @@ def main() -> None:
     # only happen when actually launching the bot.
     from google.adk.sessions.sqlite_session_service import SqliteSessionService
 
-    from app.agent import app
     from app.state import get_state_dir
 
     db_path = get_state_dir() / "sessions.db"
     session_service = SqliteSessionService(db_path=str(db_path))
-    DiscordChannel(app, session_service, token).run()
+    DiscordChannel(
+        session_service=session_service,
+        token=token,
+        extra_instruction=DISCORD_CHANNEL_INSTRUCTION,
+    ).run()
 
 
 if __name__ == "__main__":

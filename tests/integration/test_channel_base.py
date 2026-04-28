@@ -255,6 +255,57 @@ async def test_handle_message_serializes_same_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_channel_base_with_extras_builds_app(
+    workspace_dir: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Constructing a ChannelBase with `app=None` + `extra_instruction`
+    builds an App via `build_app(...)` whose agent instruction includes
+    the extra. This is the channel-extension seam Discord uses."""
+    # Patch out Runner so we don't dial the model; we only need the
+    # app construction path.
+    from app.channels import base as base_module
+
+    captured: dict[str, Any] = {}
+
+    class _StubRunner:
+        def __init__(self, *, app: Any, session_service: Any, auto_create_session: bool):
+            captured["app"] = app
+
+    monkeypatch.setattr(base_module, "Runner", _StubRunner)
+
+    ch = base_module.ChannelBase(
+        session_service=MagicMock(),
+        extra_instruction="MARKER-FROM-CHANNEL",
+    )
+    from google.adk.agents.readonly_context import ReadonlyContext
+
+    rendered = ch._app.root_agent.instruction(MagicMock(spec=ReadonlyContext))
+    assert "MARKER-FROM-CHANNEL" in rendered
+
+
+def test_channel_base_rejects_app_plus_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.channels import base as base_module
+
+    monkeypatch.setattr(base_module, "Runner", _RecordingRunner)
+
+    with pytest.raises(ValueError, match="not both"):
+        base_module.ChannelBase(
+            app=MagicMock(),
+            session_service=MagicMock(),
+            extra_instruction="x",
+        )
+
+
+def test_channel_base_requires_session_service() -> None:
+    from app.channels import base as base_module
+
+    with pytest.raises(TypeError, match="session_service"):
+        base_module.ChannelBase(app=MagicMock())
+
+
+@pytest.mark.asyncio
 async def test_handle_message_parallelizes_different_sessions() -> None:
     """Three concurrent calls on different session_ids may overlap."""
     inflight = 0
