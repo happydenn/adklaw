@@ -25,8 +25,11 @@ adklaw/
 │   │   └── discord.py        # Discord bot
 │   └── fast_api_app.py       # HTTP/SSE app (used by playground + Agent Runtime)
 ├── skills/                   # default skills shipped with the project
-├── workspace/                # human-agent collaboration space (mostly gitignored)
-│   └── AGENTS.md             # agent persona / instructions (tracked)
+├── templates/                # seed files for new workspaces
+│   └── AGENTS.md             # default persona — copied into workspace/ by init script
+├── scripts/
+│   └── init-workspace.sh     # seed a workspace from templates/
+├── workspace/                # human-agent collaboration space (gitignored, seeded by script)
 ├── .adklaw/                  # agent state dir (sessions DB, etc. — gitignored)
 └── pyproject.toml
 ```
@@ -34,8 +37,9 @@ adklaw/
 Two directories are easy to confuse — keep them straight:
 
 - **`workspace/`** — human/agent collaboration surface. Notes, files
-  the agent works on, custom skills you don't want to commit. Mostly
-  gitignored; `AGENTS.md` is the only tracked file.
+  the agent works on, your `AGENTS.md`, custom skills you don't want
+  to commit. **Fully gitignored.** Seed it once with
+  `bash scripts/init-workspace.sh`; after that it's yours to edit.
 - **`.adklaw/`** — agent state. Sessions DB, channel state, future
   caches. Fully gitignored. Override location with `ADKLAW_STATE_DIR`.
 
@@ -53,9 +57,20 @@ which defaults to `global`).
 ```bash
 agents-cli install                     # uv sync
 agents-cli login -i                    # one-time GCP auth
+bash scripts/init-workspace.sh         # seed ./workspace from templates/AGENTS.md
 agents-cli run "list every skill you have"
 agents-cli playground                  # interactive web UI
 ```
+
+`scripts/init-workspace.sh` copies `templates/AGENTS.md` into
+`./workspace/AGENTS.md` and creates `./workspace/skills/`. It refuses
+to overwrite an existing `AGENTS.md`, so re-running is safe. Pass an
+absolute path (`bash scripts/init-workspace.sh ~/my-project`) to seed
+an out-of-tree workspace.
+
+If you skip this step the agent still runs, just without a custom
+persona — it logs a one-shot info-level hint at startup pointing at
+the script.
 
 ## Customizing the agent
 
@@ -64,6 +79,10 @@ The agent's behavior is driven by `workspace/AGENTS.md`. Edit it freely
 in additional `*.md` files (`STYLE.md`, `PROFILE.md`, `CONVENTIONS.md`,
 …) at the workspace root and they'll be loaded as supplementary
 context.
+
+The template at `templates/AGENTS.md` is the canonical seed. Edit it
+in the repo if you want to change what new workspaces start with;
+existing workspaces aren't touched.
 
 To point the agent at a different workspace:
 

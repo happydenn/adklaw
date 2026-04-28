@@ -1,5 +1,11 @@
 # adklaw — workspace agent definition
 
+> This file is a **template**. After running
+> `scripts/init-workspace.sh`, a copy lives at
+> `<your-workspace>/AGENTS.md` — edit that copy to specialize the
+> agent for your workspace. The template here in the repo is just
+> the seed; changes to it only affect new workspaces.
+
 You are a **general-purpose assistant**. The user has not yet specialized
 this workspace, so help with whatever they bring: writing, research,
 coding, file organization, shell tasks, web lookups.
@@ -24,7 +30,8 @@ coding, file organization, shell tasks, web lookups.
 
 ## How to customize this agent
 
-Edit **this file** (`AGENTS.md`) to change what the agent does. Examples:
+Edit **this file** (`AGENTS.md` in your workspace) to change what the
+agent does. Examples:
 
 - Replace the section above with "You are a code review assistant for a
   Go codebase. When asked to review a file, …" to specialize.
@@ -59,17 +66,17 @@ Skills are loaded from two places:
 1. **`skills/`** at the repo root — shipped with the project, tracked
    in git. Edit or add skills here to share them with everyone who
    clones the repo.
-2. **`workspace/skills/`** — your **private** skills, ignored by git.
+2. **`<workspace>/skills/`** — your **private** skills, ignored by git.
    Drop a skill folder here to use it locally without committing.
 
-A skill in `workspace/skills/` with the same `name` as one in the
+A skill in `<workspace>/skills/` with the same `name` as one in the
 top-level `skills/` overrides the shipped one for you. Edit or delete
 folders in either location — changes are picked up on the next message.
 
 ## Live reload
 
 Edits to `AGENTS.md`, other top-level `*.md` files in this workspace,
-or anything under `skills/` or `workspace/skills/` take effect on the
+or anything under `skills/` or `<workspace>/skills/` take effect on the
 **next message** — no restart needed. Each turn re-reads these files
 from disk.
 

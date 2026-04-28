@@ -8,12 +8,12 @@
 # the human-agent collaboration surface.
 /.adklaw/
 
-# Workspace is private-by-default. Only `AGENTS.md` is tracked, so each
-# user's notes, scratch files, downloads, and any private skills they drop
-# into `workspace/skills/` stay local to their machine. Skills shipped with
-# the project live in the top-level `skills/` directory instead.
-/workspace/*
-!/workspace/AGENTS.md
+# Workspace is fully private. Seed yours from the template by running
+# `bash scripts/init-workspace.sh` (copies `templates/AGENTS.md` into
+# `./workspace/AGENTS.md`). Skills shipped with the project live in the
+# top-level `skills/` directory; private workspace skills go in
+# `<workspace>/skills/` and stay local to your machine.
+/workspace/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

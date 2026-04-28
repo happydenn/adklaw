@@ -12,11 +12,19 @@ edits take effect on the next message without restarting the agent.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORKSPACE = PROJECT_ROOT / "workspace"
+
+# Module-level latch so the "no AGENTS.md, run the init script" hint
+# fires exactly once per process. The autouse fixture in
+# tests/conftest.py resets this between tests.
+_warned_no_agents_md: bool = False
 
 
 def get_workspace() -> Path:
@@ -66,6 +74,7 @@ def load_workspace_instructions() -> str:
     after under "Additional context". Returns an empty string if neither
     exists.
     """
+    global _warned_no_agents_md
     workspace = get_workspace()
     sections: list[str] = []
 
@@ -75,6 +84,16 @@ def load_workspace_instructions() -> str:
         sections.append(
             f"# Primary instructions (from `{PRIMARY_FILE}`)\n\n{primary_content}"
         )
+    elif not _warned_no_agents_md:
+        # Hint, not an error — the agent runs fine without a persona.
+        # Logged once per process so we don't spam at every turn.
+        logger.info(
+            "No %s in workspace %s; run `scripts/init-workspace.sh` to seed "
+            "one from `templates/AGENTS.md`.",
+            PRIMARY_FILE,
+            workspace,
+        )
+        _warned_no_agents_md = True
 
     extras: list[str] = []
     for md in sorted(workspace.glob("*.md")):

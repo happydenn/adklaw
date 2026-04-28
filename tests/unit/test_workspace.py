@@ -110,3 +110,35 @@ def test_load_workspace_instructions_ignores_subdirs(workspace_dir: Path) -> Non
     nested.mkdir()
     (nested / "deep.md").write_text("hidden", encoding="utf-8")
     assert load_workspace_instructions() == ""
+
+
+def test_missing_agents_md_logs_hint_once(
+    workspace_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the workspace exists but has no AGENTS.md, a one-shot
+    info-level hint points at the init script. Subsequent calls in
+    the same process stay silent."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="app.workspace"):
+        load_workspace_instructions()
+        load_workspace_instructions()
+        load_workspace_instructions()
+    hint_messages = [
+        r for r in caplog.records if "scripts/init-workspace.sh" in r.message
+    ]
+    assert len(hint_messages) == 1
+    assert "AGENTS.md" in hint_messages[0].message
+
+
+def test_present_agents_md_does_not_log_hint(
+    workspace_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    (workspace_dir / PRIMARY_FILE).write_text("you are tested", encoding="utf-8")
+    with caplog.at_level(logging.INFO, logger="app.workspace"):
+        load_workspace_instructions()
+    assert not any(
+        "scripts/init-workspace.sh" in r.message for r in caplog.records
+    )
