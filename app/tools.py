@@ -12,6 +12,7 @@ import difflib
 import functools
 import hashlib
 import logging
+import mimetypes
 import os
 import re
 import subprocess
@@ -22,6 +23,7 @@ import urllib.request
 from pathlib import Path
 
 from google import genai
+from google.adk.tools import ToolContext
 from google.genai import types
 
 from .state import get_state_dir
@@ -33,6 +35,7 @@ MAX_FILE_BYTES = 1_000_000  # 1 MB read cap
 MAX_GREP_RESULTS = 200
 MAX_FETCH_BYTES = 2_000_000  # 2 MB fetch cap
 SHELL_TIMEOUT_SECONDS = 60
+DEFAULT_SEND_FILE_MAX_BYTES = 25_000_000
 
 WEB_SEARCH_MODEL_DEFAULT = "gemini-2.5-flash-lite"
 WEB_SEARCH_LATLNG_DEFAULT = "25.0330,121.5654"  # Taipei
@@ -615,6 +618,86 @@ def web_search(query: str) -> dict:
     )
 
 
+@functools.cache
+def _send_file_max_bytes() -> int:
+    """Largest file `send_workspace_file` will attach. We fail the
+    tool call rather than letting the channel layer silently drop a
+    file mid-reply. Configurable via `ADKLAW_SEND_FILE_MAX_BYTES`."""
+    raw = os.environ.get("ADKLAW_SEND_FILE_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_SEND_FILE_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid ADKLAW_SEND_FILE_MAX_BYTES=%r; defaulting to %d.",
+            raw,
+            DEFAULT_SEND_FILE_MAX_BYTES,
+        )
+        return DEFAULT_SEND_FILE_MAX_BYTES
+
+
+async def send_workspace_file(
+    path: str, tool_context: ToolContext
+) -> dict:
+    """Attach a file from the workspace to your reply.
+
+    Use this when the user asks you to send, share, attach, or
+    give them a specific file. The file is delivered as a real
+    attachment on the channel (e.g. as a Discord upload), not
+    pasted into the reply text. Works for any file type — images,
+    PDFs, audio, archives, source code, binaries.
+
+    Args:
+        path: File path, relative to the workspace or an absolute path
+            inside it.
+
+    Returns:
+        On success: {"status": "success", "filename": str, "mime": str,
+        "bytes": int, "version": int}.
+        On error: {"status": "error", "error": str}.
+    """
+    try:
+        target = resolve_in_workspace(path)
+    except ValueError as e:
+        return _err(str(e))
+    if not target.exists():
+        return _err(f"File does not exist: {path}")
+    if not target.is_file():
+        return _err(f"Not a file: {path}")
+    cap = _send_file_max_bytes()
+    try:
+        size = target.stat().st_size
+    except OSError as e:
+        return _err(f"Stat failed: {e}")
+    if size > cap:
+        return _err(
+            f"File too large ({size} bytes > {cap}). "
+            "Adjust ADKLAW_SEND_FILE_MAX_BYTES or split the file."
+        )
+    try:
+        data = target.read_bytes()
+    except OSError as e:
+        return _err(f"Read failed: {e}")
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    try:
+        version = await tool_context.save_artifact(
+            filename=target.name,
+            artifact=types.Part(
+                inline_data=types.Blob(data=data, mime_type=mime)
+            ),
+        )
+    except Exception as e:
+        logger.exception("save_artifact failed for %s", target)
+        return _err(f"Failed to save artifact: {e}")
+    return _ok(
+        filename=target.name,
+        mime=mime,
+        bytes=len(data),
+        version=version,
+    )
+
+
 ALL_TOOLS = [
     read_file,
     write_file,
@@ -626,4 +709,5 @@ ALL_TOOLS = [
     run_shell,
     web_fetch,
     web_search,
+    send_workspace_file,
 ]

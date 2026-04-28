@@ -53,7 +53,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
         _quote_bot_replies,
         _reply_to_bots,
     )
-    from app.tools import _web_search_client
+    from app.tools import _send_file_max_bytes, _web_search_client
 
     _allowed_user_ids.cache_clear()
     _allowlist_scope.cache_clear()
@@ -63,6 +63,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     _outbound_file_max_bytes.cache_clear()
     _quote_bot_replies.cache_clear()
     _reply_to_bots.cache_clear()
+    _send_file_max_bytes.cache_clear()
     _web_search_client.cache_clear()
     tools_module._file_read_cache.clear()
     workspace_module._warned_no_agents_md = False
@@ -76,6 +77,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
         "DISCORD_OUTBOUND_FILE_MAX_BYTES",
         "DISCORD_QUOTE_BOT_REPLIES",
         "DISCORD_REPLY_TO_BOTS",
+        "ADKLAW_SEND_FILE_MAX_BYTES",
         "ADKLAW_WEB_SEARCH_LATLNG",
         "ADKLAW_WEB_SEARCH_MODEL",
     ):

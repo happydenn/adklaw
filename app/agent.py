@@ -93,6 +93,16 @@ Repeat to walk further back through the snapshot history.
 For destructive edits (≥30% of bytes or ≥40 lines removed), pass
 `allow_large_deletion=True` only when the deletion is genuinely
 intended.
+
+## Tools — send_workspace_file
+
+If the user asks you to send, share, attach, or give them a file
+from the workspace, call `send_workspace_file(path)` instead of
+reading it and pasting the contents. The file flows back as a
+real attachment on whichever channel they're using (e.g. as a
+Discord upload). This works for binaries (images, PDFs, archives,
+audio) the same as text files — you don't need to know the file's
+type up front.
 """
 
 

@@ -423,6 +423,45 @@ async def test_handle_message_dedupes_inline_and_artifact_by_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_message_round_trips_save_artifact_via_real_service() -> None:
+    """End-to-end through the real `InMemoryArtifactService`: a tool
+    pre-saves bytes, the runner emits an `artifact_delta` event,
+    `handle_message` re-loads via the service and packs them into
+    `AgentReply.files`. Catches drift with the actual ADK contract
+    that the stub-based tests don't."""
+    from google.adk.artifacts import InMemoryArtifactService
+
+    service = InMemoryArtifactService()
+    # Pre-save what a tool would have written mid-run.
+    version = await service.save_artifact(
+        app_name="test-app",
+        user_id="u",
+        session_id="s",
+        filename="report.pdf",
+        artifact=types.Part(
+            inline_data=types.Blob(
+                data=b"%PDF-fake", mime_type="application/pdf"
+            )
+        ),
+    )
+
+    runner = _RecordingRunner(
+        events=[
+            _final_text_event("here is the report"),
+            _artifact_event("report.pdf", version),
+        ]
+    )
+    ch = _make_channel(runner, artifact_service=service)
+    reply = await ch.handle_message(user_id="u", session_id="s", message="x")
+    assert reply.text == "here is the report"
+    assert len(reply.files) == 1
+    f = reply.files[0]
+    assert f.filename == "report.pdf"
+    assert f.mime == "application/pdf"
+    assert f.data == b"%PDF-fake"
+
+
+@pytest.mark.asyncio
 async def test_handle_message_swallows_artifact_load_failures() -> None:
     """A load_artifact crash shouldn't kill the whole reply — log,
     skip the artifact, return whatever else we collected."""

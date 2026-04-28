@@ -24,6 +24,7 @@ from app.tools import (
     list_dir,
     read_file,
     run_shell,
+    send_workspace_file,
     undo_last_edit,
     web_fetch,
     web_search,
@@ -740,3 +741,150 @@ def test_web_search_latlng_invalid_falls_through(
     config = client.last_kwargs["config"]
     assert config.tool_config is None
     assert any("not-a-coord" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# send_workspace_file
+# ---------------------------------------------------------------------------
+
+
+class _StubToolContext:
+    """Minimal `tool_context` stand-in. The real `ToolContext` exposes a
+    lot more, but `send_workspace_file` only touches `save_artifact`."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.next_version = 1
+        self.save_raises: BaseException | None = None
+
+    async def save_artifact(
+        self,
+        filename: str,
+        artifact: Any,
+        custom_metadata: dict[str, Any] | None = None,
+    ) -> int:
+        self.calls.append(
+            {
+                "filename": filename,
+                "artifact": artifact,
+                "custom_metadata": custom_metadata,
+            }
+        )
+        if self.save_raises is not None:
+            raise self.save_raises
+        v = self.next_version
+        self.next_version += 1
+        return v
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_happy_path(workspace_dir: Path) -> None:
+    (workspace_dir / "hello.txt").write_text("hi there\n", encoding="utf-8")
+    ctx = _StubToolContext()
+    result = await send_workspace_file("hello.txt", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["filename"] == "hello.txt"
+    assert result["mime"] == "text/plain"
+    assert result["bytes"] == len(b"hi there\n")
+    assert result["version"] == 1
+    assert len(ctx.calls) == 1
+    saved = ctx.calls[0]
+    assert saved["filename"] == "hello.txt"
+    blob = saved["artifact"].inline_data
+    assert blob.data == b"hi there\n"
+    assert blob.mime_type == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_binary_mime(workspace_dir: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    (workspace_dir / "chart.png").write_bytes(payload)
+    ctx = _StubToolContext()
+    result = await send_workspace_file("chart.png", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["mime"] == "image/png"
+    assert ctx.calls[0]["artifact"].inline_data.data == payload
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_unknown_mime_falls_back(
+    workspace_dir: Path,
+) -> None:
+    (workspace_dir / "weird.zzz").write_bytes(b"opaque")
+    ctx = _StubToolContext()
+    result = await send_workspace_file("weird.zzz", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["mime"] == "application/octet-stream"
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_missing_returns_error(
+    workspace_dir: Path,
+) -> None:
+    ctx = _StubToolContext()
+    result = await send_workspace_file("nope.txt", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert "does not exist" in result["error"].lower()
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_directory_rejected(
+    workspace_dir: Path,
+) -> None:
+    (workspace_dir / "subdir").mkdir()
+    ctx = _StubToolContext()
+    result = await send_workspace_file("subdir", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert "not a file" in result["error"].lower()
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_outside_workspace_rejected(
+    workspace_dir: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("nope", encoding="utf-8")
+    ctx = _StubToolContext()
+    result = await send_workspace_file(str(outside), ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_oversize_rejected(
+    workspace_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ADKLAW_SEND_FILE_MAX_BYTES", "100")
+    tools._send_file_max_bytes.cache_clear()
+    (workspace_dir / "big.bin").write_bytes(b"x" * 200)
+    ctx = _StubToolContext()
+    result = await send_workspace_file("big.bin", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert "too large" in result["error"].lower()
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_returns_save_version(
+    workspace_dir: Path,
+) -> None:
+    (workspace_dir / "x.txt").write_text("x", encoding="utf-8")
+    ctx = _StubToolContext()
+    ctx.next_version = 5
+    result = await send_workspace_file("x.txt", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["version"] == 5
+
+
+@pytest.mark.asyncio
+async def test_send_workspace_file_save_failure_surfaces_error(
+    workspace_dir: Path,
+) -> None:
+    (workspace_dir / "x.txt").write_text("x", encoding="utf-8")
+    ctx = _StubToolContext()
+    ctx.save_raises = RuntimeError("storage down")
+    result = await send_workspace_file("x.txt", ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert "storage down" in result["error"]

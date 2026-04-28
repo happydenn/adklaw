@@ -101,6 +101,15 @@ Results are charged to the same Vertex billing as the main agent
 model. Flash-Lite is cheap (sub-cent per call) — no separate API key
 or service account needed.
 
+### Sending workspace files
+
+`send_workspace_file(path)` attaches a workspace file to the agent's
+reply as a real channel attachment (e.g. a Discord upload), instead
+of pasting its contents into the response. Works for any file type
+— images, PDFs, audio, archives, source. Per-file size is capped by
+`ADKLAW_SEND_FILE_MAX_BYTES` (default `25_000_000`). Drop the file
+into the workspace and ask the bot to send it.
+
 To point the agent at a different workspace:
 
 ```bash
