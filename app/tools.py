@@ -16,7 +16,6 @@ failure without raising exceptions.
 
 from __future__ import annotations
 
-import fnmatch
 import re
 import subprocess
 import urllib.error
@@ -208,12 +207,10 @@ def grep(pattern: str, path: str = ".", file_glob: str = "**/*") -> dict:
 
     workspace = get_workspace()
     matches = []
-    for file in target.rglob("*"):
+    for file in target.glob(file_glob):
         if not file.is_file():
             continue
         rel = file.relative_to(workspace)
-        if not fnmatch.fnmatch(str(rel), file_glob):
-            continue
         try:
             with file.open("r", encoding="utf-8", errors="ignore") as fh:
                 for lineno, line in enumerate(fh, start=1):
