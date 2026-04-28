@@ -12,6 +12,7 @@ from app.channels.base import (
     Origin,
     _format_context,
     _format_origin,
+    _format_reply_to,
     _id_label,
 )
 
@@ -96,3 +97,21 @@ def test_format_context_does_not_truncate_long_messages() -> None:
     msgs = [ContextMessage(sender_id="1", text=long_text)]
     out = _format_context(msgs)
     assert long_text in out
+
+
+def test_format_reply_to_with_display() -> None:
+    m = ContextMessage(sender_id="555", sender_display="alice", text="PR opened")
+    out = _format_reply_to(m)
+    assert out == (
+        "[reply_to] (the user is replying to this specific message)\n"
+        "alice (id=555): PR opened\n"
+        "[/reply_to]\n\n"
+    )
+
+
+def test_format_reply_to_without_display() -> None:
+    m = ContextMessage(sender_id="555", text="PR opened")
+    out = _format_reply_to(m)
+    assert "id=555: PR opened" in out
+    assert "[reply_to]" in out
+    assert "[/reply_to]" in out

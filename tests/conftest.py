@@ -32,9 +32,15 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _clear_caches() -> None:
+def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset any module-level `@functools.cache` state between tests so
-    env-driven config is recomputed."""
+    env-driven config is recomputed.
+
+    Also removes the channel-config env vars so a developer's local
+    `.env` (auto-loaded by `uv run`) can't leak into tests. Each test
+    that needs a specific value must `monkeypatch.setenv` it
+    explicitly.
+    """
     from app import workspace as workspace_module
     from app.channels.discord import (
         _allowed_user_ids,
@@ -52,3 +58,14 @@ def _clear_caches() -> None:
     _reply_to_bots.cache_clear()
     _web_search_client.cache_clear()
     workspace_module._warned_no_agents_md = False
+
+    for name in (
+        "DISCORD_ALLOWED_USER_IDS",
+        "DISCORD_ALLOWLIST_SCOPE",
+        "DISCORD_CONTEXT_HISTORY_LINES",
+        "DISCORD_QUOTE_BOT_REPLIES",
+        "DISCORD_REPLY_TO_BOTS",
+        "ADKLAW_WEB_SEARCH_LATLNG",
+        "ADKLAW_WEB_SEARCH_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)

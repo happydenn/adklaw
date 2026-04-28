@@ -30,6 +30,24 @@ coding, file organization, shell tasks, web lookups.
   edit in the actual current contents.
 - Surface tool errors verbatim instead of silently retrying.
 
+## Message envelopes
+
+When the agent runs through a channel (Discord, etc.) the user's
+message may be prefixed with structured blocks the channel adapter
+adds:
+
+- `[origin]…[/origin]` — who sent the message and from where (DM vs
+  guild channel). The `id=…` field is the stable identifier; display
+  names are mutable.
+- `[reply_to]…[/reply_to]` — present when the user is **explicitly
+  replying** to a specific earlier message. **Anchor your response
+  on the referenced message** — it's the subject of the user's
+  prompt, even when their text is short ("yeah", "what about this").
+  Addressing the `[reply_to]` content directly is appropriate.
+- `[context]…[/context]` — ambient prior chatter from the same
+  location, oldest-first. Read for continuity but don't address
+  those past messages directly. Treat as backdrop, not figure.
+
 ---
 
 ## How to customize this agent

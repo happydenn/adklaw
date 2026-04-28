@@ -45,6 +45,14 @@ class _FakeGuild:
 
 
 @dataclass
+class _FakeReference:
+    """Mimic `discord.MessageReference`."""
+
+    message_id: int | None
+    resolved: Any | None = None
+
+
+@dataclass
 class _FakeChannel:
     id: int
     name: str = "general"
@@ -52,6 +60,9 @@ class _FakeChannel:
     history_calls: list[dict[str, Any]] = field(default_factory=list)
     history_raises: BaseException | None = None
     sends: list[str] = field(default_factory=list)
+    fetched: dict[int, Any] = field(default_factory=dict)
+    fetch_calls: list[int] = field(default_factory=list)
+    fetch_raises: BaseException | None = None
 
     def typing(self) -> Any:
         @asynccontextmanager
@@ -65,6 +76,14 @@ class _FakeChannel:
         can assert the response went out as a plain channel message
         (no `MessageReference`) rather than a quoted reply."""
         self.sends.append(text)
+
+    async def fetch_message(self, msg_id: int) -> Any:
+        """Mimic `discord.TextChannel.fetch_message` — looks up by id in
+        `fetched`, or raises `fetch_raises` if set."""
+        self.fetch_calls.append(msg_id)
+        if self.fetch_raises is not None:
+            raise self.fetch_raises
+        return self.fetched[msg_id]
 
     def history(self, *, limit: int, before: Any) -> Any:
         """Mimic `discord.TextChannel.history` — returns an async iterator
@@ -91,6 +110,7 @@ class _FakeMessage:
     guild: _FakeGuild | None = None
     mentions: list[Any] = field(default_factory=list)
     replies: list[str] = field(default_factory=list)
+    reference: _FakeReference | None = None
 
     async def reply(self, text: str) -> None:
         self.replies.append(text)
@@ -811,3 +831,255 @@ async def test_seeded_buffer_excludes_trigger_message(
     ctx = kwargs["context"]
     assert [m.text for m in ctx] == ["lead-up"]
     assert kwargs["message"] == "hello bot"
+
+
+# ---------------------------------------------------------------------------
+# [reply_to] resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reply_to_uses_resolved_when_available(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When `message.reference.resolved` is set, use it directly — no
+    buffer lookup, no API call."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    referenced = _FakeMessage(
+        id=999,
+        author=_FakeAuthor(id=555, display_name="GitHubBot", bot=True),
+        channel=fc,
+        clean_content="PR #42 opened",
+        guild=_FakeGuild(id=7, name="my-guild"),
+    )
+    trigger = _make_guild_message(
+        msg_id=1000, sender_id=111, content="thoughts?",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=999, resolved=referenced)
+
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    assert fc.fetch_calls == []
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    rt = kwargs["reply_to"]
+    assert rt is not None
+    assert rt.sender_id == "555"
+    assert rt.sender_display == "GitHubBot"
+    assert rt.text == "PR #42 opened"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_falls_back_to_buffer(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without `resolved`, the per-channel id index resolves the
+    referenced message with zero API calls."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    earlier = _make_guild_message(
+        msg_id=500, sender_id=222, content="the bug is in foo.py",
+        fake_channel=fc, sender_name="alice",
+    )
+    await channel._on_message(earlier)  # type: ignore[arg-type]
+
+    trigger = _make_guild_message(
+        msg_id=501, sender_id=111, content="where exactly?",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=500, resolved=None)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    assert fc.fetch_calls == []
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    rt = kwargs["reply_to"]
+    assert rt is not None
+    assert rt.sender_id == "222"
+    assert rt.text == "the bug is in foo.py"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_falls_back_to_fetch_message(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither `resolved` nor the buffer has it → one REST fetch."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    fetched = _FakeMessage(
+        id=900,
+        author=_FakeAuthor(id=222, display_name="alice"),
+        channel=fc,
+        clean_content="from way back",
+        guild=_FakeGuild(id=7, name="my-guild"),
+    )
+    fc.fetched[900] = fetched
+
+    trigger = _make_guild_message(
+        msg_id=901, sender_id=111, content="hmm",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=900, resolved=None)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+
+    assert fc.fetch_calls == [900]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    rt = kwargs["reply_to"]
+    assert rt is not None
+    assert rt.text == "from way back"
+    assert rt.sender_id == "222"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_fetch_failure_skipped_silently(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If `fetch_message` raises (deleted, rate-limited, etc.) the
+    agent still gets the mention with `reply_to=None`."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    fc.fetch_raises = RuntimeError("rate limited")
+
+    trigger = _make_guild_message(
+        msg_id=1, sender_id=111, content="hmm",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=900, resolved=None)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["reply_to"] is None
+
+
+@pytest.mark.asyncio
+async def test_reply_to_truncated_when_long(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quoted text longer than `REPLY_TEXT_MAX` is truncated with an
+    ellipsis to keep the prompt focused."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    from app.channels.discord import REPLY_TEXT_MAX
+
+    fc = _FakeChannel(id=42)
+    long_text = "a" * 600
+    referenced = _FakeMessage(
+        id=999, author=_FakeAuthor(id=222, display_name="alice"),
+        channel=fc, clean_content=long_text,
+        guild=_FakeGuild(id=7, name="my-guild"),
+    )
+    trigger = _make_guild_message(
+        msg_id=1000, sender_id=111, content="?",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=999, resolved=referenced)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    rt = kwargs["reply_to"]
+    assert rt is not None
+    assert len(rt.text) == REPLY_TEXT_MAX
+    assert rt.text.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_no_reference_means_no_reply_to(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plain mention without a Discord reply → `reply_to=None`."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    trigger = _make_guild_message(
+        msg_id=1, sender_id=111, content="hi",
+        fake_channel=fc, mention_bot=channel,
+    )
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["reply_to"] is None
+    assert fc.fetch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_deleted_referenced_message_skipped(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `DeletedReferencedMessage` resolved value falls through to
+    buffer/fetch — and if neither finds it, returns None."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    import discord
+
+    class _StubParent:
+        message_id = 999
+        channel_id = 42
+        guild_id = 7
+
+    deleted = discord.DeletedReferencedMessage(_StubParent())  # type: ignore[arg-type]
+
+    fc = _FakeChannel(id=42)
+    # No buffer entry for 999, no fetched entry, fetch will raise
+    # (KeyError on dict access) — but we can't rely on that, so set
+    # fetch_raises explicitly.
+    fc.fetch_raises = RuntimeError("not found")
+    trigger = _make_guild_message(
+        msg_id=1, sender_id=111, content="hmm",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=999, resolved=deleted)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["reply_to"] is None
+
+
+@pytest.mark.asyncio
+async def test_reply_to_emits_even_when_context_disabled(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`DISCORD_CONTEXT_HISTORY_LINES=0` disables ambient `[context]` and
+    the buffer/index. `[reply_to]` must still resolve via `resolved`
+    (the only path that doesn't depend on the index)."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_CONTEXT_HISTORY_LINES", "0")
+    from app.channels.discord import _history_limit
+
+    _history_limit.cache_clear()
+
+    fc = _FakeChannel(id=42)
+    referenced = _FakeMessage(
+        id=999, author=_FakeAuthor(id=222, display_name="alice"),
+        channel=fc, clean_content="anchored",
+        guild=_FakeGuild(id=7, name="my-guild"),
+    )
+    trigger = _make_guild_message(
+        msg_id=1000, sender_id=111, content="?",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=999, resolved=referenced)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["context"] is None
+    assert kwargs["reply_to"] is not None
+    assert kwargs["reply_to"].text == "anchored"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_to_self_bot_still_emits(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user replying to one of OUR own messages must still surface
+    `[reply_to]` — that's the disambiguation we want. The `[context]`
+    self-filter does NOT apply to `[reply_to]`."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    self_id = _bot_user_for(channel).id
+    fc = _FakeChannel(id=42)
+    bot_msg = _FakeMessage(
+        id=999, author=_FakeAuthor(id=self_id, display_name="TestBot", bot=True),
+        channel=fc, clean_content="my earlier reply",
+        guild=_FakeGuild(id=7, name="my-guild"),
+    )
+    trigger = _make_guild_message(
+        msg_id=1000, sender_id=111, content="why?",
+        fake_channel=fc, mention_bot=channel,
+    )
+    trigger.reference = _FakeReference(message_id=999, resolved=bot_msg)
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    rt = kwargs["reply_to"]
+    assert rt is not None
+    assert rt.sender_id == str(self_id)
+    assert rt.text == "my earlier reply"

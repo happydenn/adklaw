@@ -146,6 +146,78 @@ async def test_handle_message_no_context_block_when_omitted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_message_orders_origin_reply_to_context() -> None:
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    origin = Origin(
+        transport="discord",
+        sender_id="111",
+        location_id="42",
+        sender_display="papi",
+        location_display="guild 'g' (id=7) / channel #general",
+    )
+    reply_to = ContextMessage(
+        sender_id="555", sender_display="GitHubBot", text="PR #42 opened"
+    )
+    context = [
+        ContextMessage(
+            sender_id="222", sender_display="alice", text="lead-up one"
+        ),
+    ]
+    await ch.handle_message(
+        user_id="111",
+        session_id="42",
+        message="thoughts?",
+        origin=origin,
+        reply_to=reply_to,
+        context=context,
+    )
+    text = runner.calls[0]["new_message"].parts[0].text
+    origin_idx = text.index("[origin]")
+    reply_idx = text.index("[reply_to]")
+    context_idx = text.index("[context]")
+    user_idx = text.index("thoughts?")
+    assert origin_idx < reply_idx < context_idx < user_idx
+    assert "GitHubBot (id=555): PR #42 opened" in text
+    assert "[/reply_to]" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_message_reply_to_alone_emits_block_no_context() -> None:
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    reply_to = ContextMessage(
+        sender_id="555", sender_display="alice", text="the bug is in foo.py"
+    )
+    await ch.handle_message(
+        user_id="u",
+        session_id="s",
+        message="where exactly?",
+        reply_to=reply_to,
+    )
+    text = runner.calls[0]["new_message"].parts[0].text
+    assert "[reply_to]" in text
+    assert "alice (id=555): the bug is in foo.py" in text
+    assert "[context]" not in text
+    assert text.endswith("where exactly?")
+
+
+@pytest.mark.asyncio
+async def test_handle_message_omits_reply_to_when_none() -> None:
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    context = [
+        ContextMessage(sender_id="222", sender_display="alice", text="hi")
+    ]
+    await ch.handle_message(
+        user_id="u", session_id="s", message="yo", context=context
+    )
+    text = runner.calls[0]["new_message"].parts[0].text
+    assert "[reply_to]" not in text
+    assert "[context]" in text
+
+
+@pytest.mark.asyncio
 async def test_handle_message_serializes_same_session() -> None:
     """Three concurrent calls on one session_id must run one-at-a-time."""
     inflight = 0

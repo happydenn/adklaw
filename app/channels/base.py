@@ -84,6 +84,14 @@ def _format_context(messages: list[ContextMessage]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_reply_to(m: ContextMessage) -> str:
+    return (
+        "[reply_to] (the user is replying to this specific message)\n"
+        f"{_id_label(m.sender_display, m.sender_id)}: {m.text}\n"
+        "[/reply_to]\n\n"
+    )
+
+
 class ChannelBase:
     """Base class for channel adapters.
 
@@ -132,6 +140,7 @@ class ChannelBase:
         session_id: str,
         message: str,
         origin: Origin | None = None,
+        reply_to: ContextMessage | None = None,
         context: list[ContextMessage] | None = None,
     ) -> str:
         """Run one turn of the agent and return its assistant text.
@@ -148,19 +157,26 @@ class ChannelBase:
                 prelude is prepended to the user content so the agent
                 can identify the sender and location. Channels build
                 this; CLI / tests can omit it.
+            reply_to: Optional single prior message the user is
+                explicitly replying to (Discord's reply feature, etc.).
+                Rendered as a `[reply_to]…[/reply_to]` block between
+                origin and context. The agent should anchor its
+                response on this message when present.
             context: Optional list of prior messages from the same
                 location, oldest-first, used to backfill conversational
                 context the agent didn't directly receive. Rendered as
-                a `[context]…[/context]` block between the origin and
-                the user message.
+                a `[context]…[/context]` block after `[reply_to]` and
+                before the user message.
 
         Returns:
             The agent's final assistant text. Tool calls and partial
             streaming events are collected internally and excluded from
             the returned string.
         """
-        prefix = (_format_origin(origin) if origin else "") + (
-            _format_context(context) if context else ""
+        prefix = (
+            (_format_origin(origin) if origin else "")
+            + (_format_reply_to(reply_to) if reply_to else "")
+            + (_format_context(context) if context else "")
         )
         text = prefix + message
         new_message = types.Content(role="user", parts=[types.Part(text=text)])

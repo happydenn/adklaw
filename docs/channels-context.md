@@ -113,14 +113,74 @@ and ship the mention to the agent **without** a `[context]` block.
 The channel is **not** marked seeded, so the next mention will retry
 the fetch. We never block on a context fetch.
 
+## Reply targeting (`[reply_to]`)
+
+`[context]` is ambient backdrop — useful, but in real usage it
+**dilutes** the agent's response when the user explicitly replied to
+a specific earlier message. The user has already pointed at what
+they care about; ambient chatter pulls the response away from it.
+
+Solution: when the triggering message has a `discord.MessageReference`
+(i.e. it's a reply), surface the referenced message as a separate
+`[reply_to]…[/reply_to]` block between `[origin]` and `[context]`:
+
+```
+[origin]
+…
+[/origin]
+
+[reply_to] (the user is replying to this specific message)
+GitHubBot (id=555): PR #142 opened by alice — fix flaky test
+[/reply_to]
+
+[context] (recent messages, oldest first)
+…
+[/context]
+
+@adklaw thoughts?
+```
+
+The persona files (`templates/AGENTS.md`, `workspace/AGENTS.md`)
+explicitly tell the agent: when `[reply_to]` is present, anchor your
+response on that referenced message; treat `[context]` as backdrop.
+
+**Resolution waterfall** in `_resolve_reply_target`:
+
+1. `message.reference.resolved` — discord.py populates this when the
+   referenced message is in cache. Free.
+2. The per-channel `_channel_message_index` (`dict[int, ContextMessage]`
+   keyed by Discord message id) we now maintain alongside the rolling
+   buffer. Zero API calls.
+3. `channel.fetch_message(id)` as a last resort. One REST call.
+4. Any failure → return `None`; the agent gets the rest of the
+   prompt without `[reply_to]`.
+
+The id index is bounded to `2 * _history_limit()` entries per channel
+via an `OrderedDict` LRU. It stores the same `ContextMessage` objects
+the buffer holds, so no duplicate text is kept.
+
+**Quoted text length cap**: 500 characters with an ellipsis. A long
+quoted blob would crowd the prompt; the gist is what matters.
+
+**Self-reference**: unlike the `[context]` self-filter, replies to
+the bot's **own** earlier messages are still surfaced — that's the
+disambiguation we want when the user says "no, the other one" in a
+reply.
+
+**No toggle.** Reply-to is an explicit user signal; surfacing it is
+default-on and unambiguously correct. If a real use case ever
+requires disabling, add `DISCORD_INCLUDE_REPLY_TO=false`.
+
 ## Transport-agnostic seam
 
 The `ContextMessage(sender_id, text, sender_display=None)` dataclass
-in `app/channels/base.py` is the contract. `_format_context()` in the
-same file owns the wire format. Future Slack / Telegram channels plug
-into the same seam — they just need to source `ContextMessage` lists
-from their own SDKs (Slack's `conversations.history`, Telegram's
-`getChat` history, etc.) and pass them into `ChannelBase.handle_message`.
+in `app/channels/base.py` is the contract. `_format_context()` and
+`_format_reply_to()` in the same file own the wire formats. Future
+Slack / Telegram channels plug into the same seam — they just need to
+source `ContextMessage` instances from their own SDKs (Slack's
+`conversations.history` and message `thread_ts` for replies,
+Telegram's `getChat` history and `reply_to_message`, etc.) and pass
+them into `ChannelBase.handle_message`.
 
 ## What's not done
 

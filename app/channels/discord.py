@@ -48,6 +48,8 @@ def _allowed_user_ids() -> frozenset[str]:
 
 DEFAULT_HISTORY_LINES = 20
 
+REPLY_TEXT_MAX = 500
+
 
 @functools.cache
 def _history_limit() -> int:
@@ -175,6 +177,13 @@ class DiscordChannel(ChannelBase):
         # only the FIRST mention in a channel triggers an API call.
         self._channel_buffers: dict[int, collections.deque[ContextMessage]] = {}
         self._seeded_channels: set[int] = set()
+        # Per-channel index from Discord message id → ContextMessage,
+        # used by `_resolve_reply_target` to serve `[reply_to]` without
+        # an API call when the referenced message is recent. Pruned to
+        # `2 * _history_limit()` entries per channel to bound memory.
+        self._channel_message_index: dict[
+            int, collections.OrderedDict[int, ContextMessage]
+        ] = {}
 
         @self._client.event
         async def on_ready() -> None:
@@ -183,6 +192,26 @@ class DiscordChannel(ChannelBase):
         @self._client.event
         async def on_message(message: discord.Message) -> None:
             await self._on_message(message)
+
+    def _index_message(
+        self, channel_id: int, msg_id: int, cm: ContextMessage
+    ) -> None:
+        """Record `msg_id → cm` in the per-channel id index, evicting
+        the oldest entries when the index exceeds `2 * _history_limit()`."""
+        limit = _history_limit()
+        if limit <= 0:
+            return
+        cap = 2 * limit
+        idx = self._channel_message_index.get(channel_id)
+        if idx is None:
+            idx = collections.OrderedDict()
+            self._channel_message_index[channel_id] = idx
+        # Re-inserting moves the entry to the end (most recent).
+        if msg_id in idx:
+            idx.move_to_end(msg_id)
+        idx[msg_id] = cm
+        while len(idx) > cap:
+            idx.popitem(last=False)
 
     def _record_in_buffer(self, message: discord.Message) -> None:
         """Append a guild message to its channel's rolling context buffer.
@@ -208,13 +237,13 @@ class DiscordChannel(ChannelBase):
         if buf is None:
             buf = collections.deque(maxlen=limit)
             self._channel_buffers[message.channel.id] = buf
-        buf.append(
-            ContextMessage(
-                sender_id=str(message.author.id),
-                sender_display=message.author.display_name,
-                text=text,
-            )
+        cm = ContextMessage(
+            sender_id=str(message.author.id),
+            sender_display=message.author.display_name,
+            text=text,
         )
+        buf.append(cm)
+        self._index_message(message.channel.id, message.id, cm)
 
     async def _build_context(
         self, message: discord.Message
@@ -241,7 +270,9 @@ class DiscordChannel(ChannelBase):
             return buf_list[:-1] if buf_list else []
 
         # First mention since startup — backfill via REST.
-        msgs: list[ContextMessage] = []
+        # Collect (msg_id, ContextMessage) pairs so we can populate the
+        # id index alongside the buffer.
+        pairs: list[tuple[int, ContextMessage]] = []
         bot_user_id = (
             self._client.user.id if self._client.user is not None else None
         )
@@ -257,11 +288,14 @@ class DiscordChannel(ChannelBase):
                 text = hist.clean_content
                 if not text:
                     continue
-                msgs.append(
-                    ContextMessage(
-                        sender_id=str(hist.author.id),
-                        sender_display=hist.author.display_name,
-                        text=text,
+                pairs.append(
+                    (
+                        hist.id,
+                        ContextMessage(
+                            sender_id=str(hist.author.id),
+                            sender_display=hist.author.display_name,
+                            text=text,
+                        ),
                     )
                 )
         except Exception:
@@ -272,7 +306,8 @@ class DiscordChannel(ChannelBase):
             )
             return []
         # discord.py yields newest-first; reverse to oldest-first.
-        msgs.reverse()
+        pairs.reverse()
+        msgs = [cm for _, cm in pairs]
         # Seed the buffer with what we got so subsequent mentions can
         # serve from memory.
         buf: collections.deque[ContextMessage] = collections.deque(
@@ -280,7 +315,66 @@ class DiscordChannel(ChannelBase):
         )
         self._channel_buffers[channel_id] = buf
         self._seeded_channels.add(channel_id)
+        # Populate the id index for `_resolve_reply_target`.
+        for mid, cm in pairs:
+            self._index_message(channel_id, mid, cm)
         return msgs
+
+    async def _resolve_reply_target(
+        self, message: discord.Message
+    ) -> ContextMessage | None:
+        """Return the message the user is explicitly replying to, or None.
+
+        Resolution waterfall:
+        1. `message.reference.resolved` (cheap, in-cache).
+        2. Per-channel id index (zero API calls).
+        3. `channel.fetch_message(id)` (one REST call).
+        4. Any failure → return None and proceed without `[reply_to]`.
+        """
+        try:
+            import discord
+        except ModuleNotFoundError:
+            return None
+        ref = getattr(message, "reference", None)
+        if ref is None:
+            return None
+        ref_msg_id = getattr(ref, "message_id", None)
+        if ref_msg_id is None:
+            return None
+
+        referenced: discord.Message | None = None
+        resolved = getattr(ref, "resolved", None)
+        if resolved is not None and not isinstance(
+            resolved, discord.DeletedReferencedMessage
+        ):
+            referenced = resolved
+        else:
+            idx = self._channel_message_index.get(message.channel.id)
+            cached = idx.get(ref_msg_id) if idx is not None else None
+            if cached is not None:
+                return cached
+            try:
+                referenced = await message.channel.fetch_message(ref_msg_id)
+            except Exception:
+                logger.debug(
+                    "Failed to fetch reply target %s on channel %s",
+                    ref_msg_id,
+                    message.channel.id,
+                )
+                return None
+
+        if referenced is None:
+            return None
+        text = (referenced.clean_content or "").strip()
+        if not text:
+            return None
+        if len(text) > REPLY_TEXT_MAX:
+            text = text[: REPLY_TEXT_MAX - 1].rstrip() + "…"
+        return ContextMessage(
+            sender_id=str(referenced.author.id),
+            sender_display=referenced.author.display_name,
+            text=text,
+        )
 
     async def _on_message(self, message: discord.Message) -> None:
         # Record every guild message into the channel's rolling buffer
@@ -376,6 +470,12 @@ class DiscordChannel(ChannelBase):
         if not is_dm:
             context = await self._build_context(message)
 
+        # Surface the message the user is explicitly replying to (if
+        # any) as a `[reply_to]` block. Always evaluated — DMs support
+        # replies too, and the explicit anchor is valuable even when
+        # the session has full history.
+        reply_to = await self._resolve_reply_target(message)
+
         # When responding to another bot, default to a plain
         # `channel.send(...)` so the response carries no `MessageReference`
         # mention back at the other bot. Human authors always get the
@@ -396,6 +496,7 @@ class DiscordChannel(ChannelBase):
                     session_id=str(message.channel.id),
                     message=prompt,
                     origin=origin,
+                    reply_to=reply_to,
                     context=context or None,
                 )
         except Exception:

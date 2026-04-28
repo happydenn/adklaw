@@ -193,6 +193,16 @@ risk). Pair with `DISCORD_ALLOWED_USER_IDS` +
 `DISCORD_ALLOWLIST_SCOPE=all` to restrict which bots can wake the
 agent.
 
+**Reply targeting.** When the user explicitly replies to a specific
+earlier message (Discord's reply feature), that referenced message is
+surfaced to the agent as a dedicated `[reply_to]…[/reply_to]` block
+between `[origin]` and `[context]`. The agent persona instructs the
+agent to anchor its response on that referenced message rather than
+generalising over ambient context. Resolution is a waterfall:
+`message.reference.resolved` (cached) → per-channel id index (zero
+API calls) → `channel.fetch_message()` as a last resort. Quoted text
+is truncated to 500 chars. Always on; no toggle.
+
 **Conversation context backfill in channels.** When the bot is
 mentioned in a guild channel, it backfills the recent message history
 so the agent can follow the conversation flow rather than seeing only
