@@ -45,7 +45,13 @@ class DiscordChannel(ChannelBase):
         super().__init__(app, session_service)
         # Imported lazily so the rest of the project doesn't require
         # discord.py to be installed.
-        import discord
+        try:
+            import discord
+        except ModuleNotFoundError as e:
+            raise SystemExit(
+                "discord.py is not installed. Run `uv sync --extra discord` "
+                "and try again."
+            ) from e
 
         intents = discord.Intents.default()
         intents.message_content = True
