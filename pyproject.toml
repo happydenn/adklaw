@@ -22,6 +22,9 @@ dev = [
 ]
 
 [project.optional-dependencies]
+discord = [
+    "discord.py>=2.5,<3",
+]
 eval = [
     "google-adk[eval]>=1.15.0,<2.0.0",
 ]

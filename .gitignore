@@ -3,10 +3,15 @@
 .adk/
 .google-agents-cli/
 
+# Agent state directory (sessions DB, channel state, internal caches).
+# Kept separate from `workspace/` so internal machinery does not pollute
+# the human-agent collaboration surface.
+/.adklaw/
+
 # Workspace is private-by-default. Only `AGENTS.md` is tracked, so each
 # user's notes, scratch files, downloads, and any private skills they drop
 # into `workspace/skills/` stay local to their machine. Skills shipped with
-# the project live in the top-level `default_skills/` directory instead.
+# the project live in the top-level `skills/` directory instead.
 /workspace/*
 !/workspace/AGENTS.md
 
