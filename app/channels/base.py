@@ -18,6 +18,7 @@ handled here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from google.adk.apps import App
@@ -36,6 +37,13 @@ class ChannelBase:
     Subclasses construct a `ChannelBase` with the agent's `App` and a
     `BaseSessionService`, then call `handle_message()` whenever a message
     arrives on their transport.
+
+    Concurrent messages targeting the **same** `session_id` are
+    serialized with an in-process `asyncio.Lock`. ADK's session services
+    use optimistic concurrency on `last_update_time`, so two overlapping
+    `runner.run_async()` invocations against one session would race and
+    the second would fail with a stale-session error. Per-session
+    serialization avoids that without blocking unrelated conversations.
     """
 
     def __init__(self, app: App, session_service: BaseSessionService):
@@ -46,11 +54,23 @@ class ChannelBase:
             session_service=session_service,
             auto_create_session=True,
         )
+        # session_id -> Lock. All channel work runs on a single asyncio
+        # loop, so a plain dict is safe. Entries are not evicted; for a
+        # personal bot the working set is small. Add an LRU if the
+        # process ever serves thousands of distinct sessions.
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def runner(self) -> Runner:
         """Exposed for advanced subclasses that want to stream events."""
         return self._runner
+
+    def _lock_for(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
 
     async def handle_message(
         self,
@@ -76,17 +96,18 @@ class ChannelBase:
         """
         new_message = types.Content(role="user", parts=[types.Part(text=message)])
         chunks: list[str] = []
-        async with Aclosing(
-            self._runner.run_async(
-                user_id=user_id,
-                session_id=session_id,
-                new_message=new_message,
-            )
-        ) as events:
-            async for event in events:
-                text = _final_text(event)
-                if text:
-                    chunks.append(text)
+        async with self._lock_for(session_id):
+            async with Aclosing(
+                self._runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=new_message,
+                )
+            ) as events:
+                async for event in events:
+                    text = _final_text(event)
+                    if text:
+                        chunks.append(text)
         return "".join(chunks).strip()
 
 
