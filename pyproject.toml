@@ -98,6 +98,10 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 pythonpath = "."
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live: tests that hit Vertex AI / live external services. Skipped by default; run with `-m live`.",
+]
+addopts = "-m 'not live'"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app","frontend"]

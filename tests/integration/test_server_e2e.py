@@ -112,6 +112,7 @@ def server_fixture(request: Any) -> Iterator[subprocess.Popen[str]]:
     yield server_process
 
 
+@pytest.mark.live
 def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
     """Test the chat stream functionality."""
     logger.info("Starting chat stream test")
@@ -174,6 +175,7 @@ def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
     assert has_text_content, "Expected at least one event with text content"
 
 
+@pytest.mark.live
 def test_chat_stream_error_handling(server_fixture: subprocess.Popen[str]) -> None:
     """Test the chat stream error handling."""
     logger.info("Starting chat stream error handling test")
@@ -190,6 +192,7 @@ def test_chat_stream_error_handling(server_fixture: subprocess.Popen[str]) -> No
     logger.info("Error handling test completed successfully")
 
 
+@pytest.mark.live
 def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
     """
     Test the feedback collection endpoint (/feedback) to ensure it properly
