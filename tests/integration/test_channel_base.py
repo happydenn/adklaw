@@ -18,7 +18,7 @@ import pytest
 from google.adk.events import Event
 from google.genai import types
 
-from app.channels.base import ChannelBase, ContextMessage, Origin
+from app.channels.base import ChannelBase, ContextMessage, DroppedAttachment, Origin
 
 
 def _final_text_event(text: str) -> Event:
@@ -215,6 +215,59 @@ async def test_handle_message_omits_reply_to_when_none() -> None:
     text = runner.calls[0]["new_message"].parts[0].text
     assert "[reply_to]" not in text
     assert "[context]" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_message_includes_attachment_parts() -> None:
+    """Attachments ride alongside the text Part on the user Content;
+    text is always first, attachment Parts come after."""
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    img_part = types.Part(
+        inline_data=types.Blob(data=b"\x89PNG...", mime_type="image/png")
+    )
+    pdf_part = types.Part(
+        inline_data=types.Blob(data=b"%PDF...", mime_type="application/pdf")
+    )
+    await ch.handle_message(
+        user_id="u",
+        session_id="s",
+        message="what is this?",
+        attachments=[img_part, pdf_part],
+    )
+    sent = runner.calls[0]["new_message"]
+    assert len(sent.parts) == 3
+    assert sent.parts[0].text == "what is this?"
+    assert sent.parts[1].inline_data.mime_type == "image/png"
+    assert sent.parts[2].inline_data.mime_type == "application/pdf"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_renders_skipped_block() -> None:
+    """`attachments_skipped` items render an `[attachments_skipped]`
+    block in the user text prefix so the agent can tell the user
+    what was dropped."""
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    skipped = [
+        DroppedAttachment(
+            filename="report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            size=1_500_000,
+            reason="unsupported type",
+        ),
+    ]
+    await ch.handle_message(
+        user_id="u",
+        session_id="s",
+        message="take a look",
+        attachments_skipped=skipped,
+    )
+    text = runner.calls[0]["new_message"].parts[0].text
+    assert "[attachments_skipped]" in text
+    assert "report.docx" in text
+    assert "unsupported type" in text
+    assert text.endswith("take a look")
 
 
 @pytest.mark.asyncio

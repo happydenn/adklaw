@@ -203,6 +203,20 @@ generalising over ambient context. Resolution is a waterfall:
 API calls) → `channel.fetch_message()` as a last resort. Quoted text
 is truncated to 500 chars. Always on; no toggle.
 
+**Attachments.** Image, audio, video, and PDF attachments on Discord
+messages are forwarded to the model inline. Small text attachments
+(< 64 KB) are decoded and inlined into the prompt as
+`[attachment_text filename="…"]…[/attachment_text]` blocks. Anything
+else — unsupported mime, oversized files, failed downloads — is
+reported back to the agent in an `[attachments_skipped]` block so it
+can tell the user what was dropped (e.g. "send as PDF instead of
+.docx"). Defaults: 10 MB per attachment
+(`DISCORD_ATTACHMENT_MAX_BYTES`), 18 MB total per message
+(`DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES`). Supported binary types:
+PNG/JPEG/WebP/HEIC/HEIF, WAV/MP3/AIFF/AAC/OGG/FLAC,
+MP4/MPEG/MOV/AVI/FLV/WebM/WMV/3GPP, and PDF. An attachment-only
+message (no text) still wakes the agent.
+
 **Conversation context backfill in channels.** When the bot is
 mentioned in a guild channel, it backfills the recent message history
 so the agent can follow the conversation flow rather than seeing only

@@ -53,6 +53,23 @@ class _FakeReference:
 
 
 @dataclass
+class _FakeAttachment:
+    """Mimic `discord.Attachment`."""
+
+    filename: str
+    content_type: str | None
+    size: int
+    _data: bytes = b""
+    _read_raises: BaseException | None = None
+    id: int = 0
+
+    async def read(self) -> bytes:
+        if self._read_raises is not None:
+            raise self._read_raises
+        return self._data
+
+
+@dataclass
 class _FakeChannel:
     id: int
     name: str = "general"
@@ -111,6 +128,7 @@ class _FakeMessage:
     mentions: list[Any] = field(default_factory=list)
     replies: list[str] = field(default_factory=list)
     reference: _FakeReference | None = None
+    attachments: list[_FakeAttachment] = field(default_factory=list)
 
     async def reply(self, text: str) -> None:
         self.replies.append(text)
@@ -1083,3 +1101,216 @@ async def test_reply_to_to_self_bot_still_emits(
     assert rt is not None
     assert rt.sender_id == str(self_id)
     assert rt.text == "my earlier reply"
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+
+def _make_dm_with_attachments(
+    attachments: list[_FakeAttachment], content: str = "look at this"
+) -> _FakeMessage:
+    return _FakeMessage(
+        id=1,
+        author=_FakeAuthor(id=1, display_name="papi"),
+        channel=_FakeChannel(id=42),
+        clean_content=content,
+        attachments=attachments,
+    )
+
+
+@pytest.mark.asyncio
+async def test_attachment_image_becomes_inline_data(
+    channel: DiscordChannel,
+) -> None:
+    img = _FakeAttachment(
+        filename="screenshot.png",
+        content_type="image/png",
+        size=1024,
+        _data=b"\x89PNG" + b"\x00" * 1020,
+    )
+    msg = _make_dm_with_attachments([img])
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    parts = kwargs["attachments"]
+    assert len(parts) == 1
+    assert parts[0].inline_data.mime_type == "image/png"
+    assert parts[0].inline_data.data == img._data
+    assert kwargs["attachments_skipped"] == []
+
+
+@pytest.mark.asyncio
+async def test_attachment_unsupported_mime_skipped(
+    channel: DiscordChannel,
+) -> None:
+    docx = _FakeAttachment(
+        filename="report.docx",
+        content_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        size=20_000,
+        _data=b"PK" + b"\x00" * 19_998,
+    )
+    msg = _make_dm_with_attachments([docx])
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["attachments"] == []
+    skipped = kwargs["attachments_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0].filename == "report.docx"
+    assert "unsupported" in skipped[0].reason
+
+
+@pytest.mark.asyncio
+async def test_attachment_too_large_skipped(channel: DiscordChannel) -> None:
+    huge = _FakeAttachment(
+        filename="big.png",
+        content_type="image/png",
+        size=50_000_000,
+        _data=b"",  # `_data` not used because size check fires first
+    )
+    msg = _make_dm_with_attachments([huge])
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["attachments"] == []
+    skipped = kwargs["attachments_skipped"]
+    assert len(skipped) == 1
+    assert "per-attachment cap" in skipped[0].reason
+
+
+@pytest.mark.asyncio
+async def test_attachments_total_cap_greedy_fill(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three 8-MB images with 18 MB total cap → first two pass,
+    third skipped."""
+    from app.channels.discord import (
+        _attachment_max_bytes,
+        _attachments_max_total_bytes,
+    )
+
+    monkeypatch.setenv("DISCORD_ATTACHMENT_MAX_BYTES", "10000000")
+    monkeypatch.setenv("DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES", "18000000")
+    _attachment_max_bytes.cache_clear()
+    _attachments_max_total_bytes.cache_clear()
+
+    eight_mb = b"x" * 8_000_000
+    imgs = [
+        _FakeAttachment(
+            filename=f"img{i}.png",
+            content_type="image/png",
+            size=len(eight_mb),
+            _data=eight_mb,
+        )
+        for i in range(3)
+    ]
+    msg = _make_dm_with_attachments(imgs)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert len(kwargs["attachments"]) == 2
+    skipped = kwargs["attachments_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0].filename == "img2.png"
+    assert "total cap" in skipped[0].reason
+
+
+@pytest.mark.asyncio
+async def test_attachment_text_inlined_into_prompt(
+    channel: DiscordChannel,
+) -> None:
+    log = _FakeAttachment(
+        filename="error.log",
+        content_type="text/plain",
+        size=20,
+        _data=b"NullPointerException at line 42",
+    )
+    log.size = len(log._data)
+    msg = _make_dm_with_attachments([log], content="what's wrong?")
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["attachments"] == []
+    assert kwargs["attachments_skipped"] == []
+    prompt = kwargs["message"]
+    assert '[attachment_text filename="error.log"]' in prompt
+    assert "NullPointerException at line 42" in prompt
+    assert "[/attachment_text]" in prompt
+    assert prompt.endswith("what's wrong?")
+
+
+@pytest.mark.asyncio
+async def test_attachment_text_too_large_skipped(
+    channel: DiscordChannel,
+) -> None:
+    big_log = _FakeAttachment(
+        filename="huge.log",
+        content_type="text/plain",
+        size=200_000,
+        _data=b"x" * 200_000,
+    )
+    msg = _make_dm_with_attachments([big_log])
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["attachments"] == []
+    assert "[attachment_text" not in kwargs["message"]
+    skipped = kwargs["attachments_skipped"]
+    assert len(skipped) == 1
+    assert "text too large" in skipped[0].reason
+
+
+@pytest.mark.asyncio
+async def test_attachment_download_failure_reported(
+    channel: DiscordChannel,
+) -> None:
+    img = _FakeAttachment(
+        filename="screenshot.png",
+        content_type="image/png",
+        size=1024,
+        _read_raises=RuntimeError("network drop"),
+    )
+    msg = _make_dm_with_attachments([img])
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["attachments"] == []
+    skipped = kwargs["attachments_skipped"]
+    assert len(skipped) == 1
+    assert "download failed" in skipped[0].reason
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_message_still_dispatches(
+    channel: DiscordChannel,
+) -> None:
+    """Image with no text body should still trigger the agent."""
+    img = _FakeAttachment(
+        filename="screenshot.png",
+        content_type="image/png",
+        size=10,
+        _data=b"\x89PNG\x00\x00\x00\x00\x00\x00",
+    )
+    msg = _FakeMessage(
+        id=1,
+        author=_FakeAuthor(id=1, display_name="papi"),
+        channel=_FakeChannel(id=42),
+        clean_content="",  # no text
+        attachments=[img],
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert len(kwargs["attachments"]) == 1
+    assert kwargs["message"] == ""
+
+
+@pytest.mark.asyncio
+async def test_no_attachments_no_extra_block(
+    channel: DiscordChannel,
+) -> None:
+    msg = _make_message(sender_id=1, content="hi", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["attachments"] == []
+    assert kwargs["attachments_skipped"] == []

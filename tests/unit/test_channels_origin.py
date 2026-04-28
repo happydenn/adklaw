@@ -9,7 +9,9 @@ import pytest
 
 from app.channels.base import (
     ContextMessage,
+    DroppedAttachment,
     Origin,
+    _format_attachments_skipped,
     _format_context,
     _format_origin,
     _format_reply_to,
@@ -115,3 +117,42 @@ def test_format_reply_to_without_display() -> None:
     assert "id=555: PR opened" in out
     assert "[reply_to]" in out
     assert "[/reply_to]" in out
+
+
+def test_format_attachments_skipped_empty_returns_empty() -> None:
+    assert _format_attachments_skipped([]) == ""
+
+
+def test_format_attachments_skipped_renders_block() -> None:
+    items = [
+        DroppedAttachment(
+            filename="report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            size=1_500_000,
+            reason="unsupported type",
+        ),
+        DroppedAttachment(
+            filename="huge.mp4",
+            mime="video/mp4",
+            size=50_000_000,
+            reason="exceeds per-attachment cap (10000000 bytes)",
+        ),
+    ]
+    out = _format_attachments_skipped(items)
+    assert out.startswith("[attachments_skipped]\n")
+    assert "[/attachments_skipped]" in out
+    assert "report.docx" in out
+    assert "unsupported type" in out
+    assert "huge.mp4" in out
+    assert "1.5 MB" in out
+    assert "50.0 MB" in out
+
+
+def test_format_attachments_skipped_handles_unknown_mime() -> None:
+    items = [
+        DroppedAttachment(
+            filename="weird", mime=None, size=0, reason="unsupported type"
+        )
+    ]
+    out = _format_attachments_skipped(items)
+    assert "weird (?, 0.0 MB)" in out

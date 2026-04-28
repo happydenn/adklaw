@@ -62,6 +62,21 @@ class ContextMessage:
     sender_display: str | None = None
 
 
+@dataclass(frozen=True)
+class DroppedAttachment:
+    """An attachment the channel saw but couldn't forward to the model.
+
+    Surfaced to the agent as an `[attachments_skipped]` block so it can
+    tell the user what was filtered (and why) instead of pretending
+    nothing was attached.
+    """
+
+    filename: str
+    mime: str | None
+    size: int
+    reason: str
+
+
 def _id_label(display: str | None, id_: str) -> str:
     return f"{display} (id={id_})" if display else f"id={id_}"
 
@@ -98,6 +113,20 @@ def _format_reply_to(m: ContextMessage) -> str:
         f"{_id_label(m.sender_display, m.sender_id)}: {m.text}\n"
         "[/reply_to]\n\n"
     )
+
+
+def _format_attachments_skipped(items: Sequence[DroppedAttachment]) -> str:
+    if not items:
+        return ""
+    lines = ["[attachments_skipped]"]
+    for it in items:
+        size_mb = it.size / 1_000_000 if it.size else 0
+        mime = it.mime or "?"
+        lines.append(
+            f"- {it.filename} ({mime}, {size_mb:.1f} MB) — {it.reason}"
+        )
+    lines.append("[/attachments_skipped]\n")
+    return "\n".join(lines) + "\n"
 
 
 class ChannelBase:
@@ -175,6 +204,8 @@ class ChannelBase:
         origin: Origin | None = None,
         reply_to: ContextMessage | None = None,
         context: list[ContextMessage] | None = None,
+        attachments: Sequence[types.Part] = (),
+        attachments_skipped: Sequence[DroppedAttachment] = (),
     ) -> str:
         """Run one turn of the agent and return its assistant text.
 
@@ -200,6 +231,15 @@ class ChannelBase:
                 context the agent didn't directly receive. Rendered as
                 a `[context]…[/context]` block after `[reply_to]` and
                 before the user message.
+            attachments: Multimodal `Part`s (images, audio, video,
+                PDF, etc.) the channel downloaded and prepared for
+                the model. Appended after the text Part on the user
+                message's `Content`.
+            attachments_skipped: Attachments the channel saw but
+                couldn't forward (unsupported mime, too large, etc.).
+                Rendered as an `[attachments_skipped]` block in the
+                text prefix so the agent can tell the user what was
+                dropped.
 
         Returns:
             The agent's final assistant text. Tool calls and partial
@@ -210,9 +250,12 @@ class ChannelBase:
             (_format_origin(origin) if origin else "")
             + (_format_reply_to(reply_to) if reply_to else "")
             + (_format_context(context) if context else "")
+            + _format_attachments_skipped(attachments_skipped)
         )
         text = prefix + message
-        new_message = types.Content(role="user", parts=[types.Part(text=text)])
+        parts: list[types.Part] = [types.Part(text=text)]
+        parts.extend(attachments)
+        new_message = types.Content(role="user", parts=parts)
         chunks: list[str] = []
         async with self._lock_for(session_id):
             async with Aclosing(

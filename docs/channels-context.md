@@ -196,6 +196,52 @@ editing two files together: the formatter in
 `app/channels/base.py` and the explanation in the corresponding
 `<CHANNEL>_INSTRUCTION` constant.
 
+## Attachments
+
+Discord messages routinely carry attachments — screenshots, PDFs,
+audio clips, short text files. The model is multimodal, so we
+forward attachments inline rather than dropping to "the bot only
+reads text".
+
+The seam matches the rest of `ChannelBase`: each channel does the
+transport-specific download + filter, then hands ready-made
+`google.genai.types.Part` objects to `handle_message(...,
+attachments=...)`. ADK plumbing stays out of channel code.
+
+**What's forwarded.** A fixed allow-list of mime types Gemini
+accepts as `inline_data`: image (PNG/JPEG/WebP/HEIC/HEIF), audio
+(WAV/MP3/AIFF/AAC/OGG/FLAC), video
+(MP4/MPEG/MOV/AVI/FLV/WebM/WMV/3GPP), and PDF. `text/*` files
+under 64 KB are decoded as UTF-8 (lossy) and inlined into the
+user-text as `[attachment_text filename="…"]…[/attachment_text]` —
+cleaner than a separate Part for short logs/scripts the user
+pasted as a file.
+
+**Size caps.** Per-attachment cap (`DISCORD_ATTACHMENT_MAX_BYTES`,
+default 10 MB) and total-per-message cap
+(`DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES`, default 18 MB). Greedy
+fill: take attachments in declared order until the total cap;
+skip the rest. Discord's own 10-attachment limit means we don't
+add a count cap on top.
+
+**Skipped reporting.** Anything the channel saw but couldn't
+forward — unsupported mime, oversized, download failed — becomes
+a `DroppedAttachment(filename, mime, size, reason)`. The list
+renders as a `[attachments_skipped]` block in the user-text
+prefix so the agent can tell the user what's missing instead of
+pretending nothing was attached. The persona instruction tells
+the agent to acknowledge skips and suggest a workaround (e.g.
+"send as PDF instead of .docx").
+
+**No persistence.** Bytes flow straight from Discord into the
+model request and are kept only as part of the ADK session log.
+No on-disk cache.
+
+**Reply-target attachments.** Out of scope for v1. The
+`[reply_to]` resolver currently surfaces only text. Surfacing
+the referenced message's attachments doubles the download budget
+question; defer until there's a concrete need.
+
 ## Transport-agnostic seam
 
 The `ContextMessage(sender_id, text, sender_display=None)` dataclass

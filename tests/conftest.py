@@ -46,6 +46,8 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.channels.discord import (
         _allowed_user_ids,
         _allowlist_scope,
+        _attachment_max_bytes,
+        _attachments_max_total_bytes,
         _history_limit,
         _quote_bot_replies,
         _reply_to_bots,
@@ -54,6 +56,8 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _allowed_user_ids.cache_clear()
     _allowlist_scope.cache_clear()
+    _attachment_max_bytes.cache_clear()
+    _attachments_max_total_bytes.cache_clear()
     _history_limit.cache_clear()
     _quote_bot_replies.cache_clear()
     _reply_to_bots.cache_clear()
@@ -64,6 +68,8 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "DISCORD_ALLOWED_USER_IDS",
         "DISCORD_ALLOWLIST_SCOPE",
+        "DISCORD_ATTACHMENT_MAX_BYTES",
+        "DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES",
         "DISCORD_CONTEXT_HISTORY_LINES",
         "DISCORD_QUOTE_BOT_REPLIES",
         "DISCORD_REPLY_TO_BOTS",

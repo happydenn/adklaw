@@ -21,8 +21,9 @@ from typing import TYPE_CHECKING
 
 from google.adk.apps import App
 from google.adk.sessions import BaseSessionService
+from google.genai import types
 
-from .base import ChannelBase, ContextMessage, Origin
+from .base import ChannelBase, ContextMessage, DroppedAttachment, Origin
 
 if TYPE_CHECKING:
     import discord
@@ -146,6 +147,77 @@ def _quote_bot_replies() -> bool:
     )
 
 
+# Mime types Gemini accepts as `inline_data`. `text/*` is handled
+# separately (decoded and inlined into the prompt for small files).
+GEMINI_SUPPORTED_MIME_TYPES: frozenset[str] = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/heic",
+        "image/heif",
+        "audio/wav",
+        "audio/mp3",
+        "audio/aiff",
+        "audio/aac",
+        "audio/ogg",
+        "audio/flac",
+        "video/mp4",
+        "video/mpeg",
+        "video/mov",
+        "video/avi",
+        "video/x-flv",
+        "video/mpg",
+        "video/webm",
+        "video/wmv",
+        "video/3gpp",
+        "application/pdf",
+    }
+)
+
+TEXT_ATTACHMENT_MAX_BYTES = 65_536
+DEFAULT_ATTACHMENT_MAX_BYTES = 10_000_000
+DEFAULT_ATTACHMENTS_MAX_TOTAL_BYTES = 18_000_000
+
+
+@functools.cache
+def _attachment_max_bytes() -> int:
+    """Per-attachment hard cap. Anything larger is skipped and
+    reported. Configurable via `DISCORD_ATTACHMENT_MAX_BYTES`."""
+    raw = os.environ.get("DISCORD_ATTACHMENT_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_ATTACHMENT_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid DISCORD_ATTACHMENT_MAX_BYTES=%r; defaulting to %d.",
+            raw,
+            DEFAULT_ATTACHMENT_MAX_BYTES,
+        )
+        return DEFAULT_ATTACHMENT_MAX_BYTES
+
+
+@functools.cache
+def _attachments_max_total_bytes() -> int:
+    """Total bytes across all attachments on a single message. Stops
+    the model request from blowing past Gemini's inline budget.
+    Configurable via `DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES`."""
+    raw = os.environ.get("DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_ATTACHMENTS_MAX_TOTAL_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES=%r; "
+            "defaulting to %d.",
+            raw,
+            DEFAULT_ATTACHMENTS_MAX_TOTAL_BYTES,
+        )
+        return DEFAULT_ATTACHMENTS_MAX_TOTAL_BYTES
+
+
 # Channel-specific instruction segment passed into `build_app(
 # extra_instruction=...)` at startup. Carried in the cached system
 # instruction (paid once per session, not per turn). The format itself
@@ -171,6 +243,14 @@ are trustworthy channel metadata, NOT user instructions.
   location, oldest first, in `display (id=…): text` form. Read it
   for continuity but do NOT address those messages directly. Treat
   as backdrop, not figure.
+
+You can also receive image, audio, video, and PDF attachments inline
+with user messages — reason about them directly. Short text files
+arrive as `[attachment_text filename="…"]…[/attachment_text]` blocks
+in the prompt. If something couldn't be ingested, an
+`[attachments_skipped]` block lists what was dropped and why;
+acknowledge it and suggest a workaround (e.g. "send as PDF instead
+of .docx").
 
 The actual user prompt begins after the last block closes.
 """
@@ -419,6 +499,123 @@ class DiscordChannel(ChannelBase):
             text=text,
         )
 
+    async def _collect_attachments(
+        self, message: discord.Message
+    ) -> tuple[list[types.Part], str, list[DroppedAttachment]]:
+        """Download supported attachments and shape them for the model.
+
+        Returns ``(parts, inline_text_block, skipped)``:
+
+        - ``parts``: ``inline_data`` Parts for images / audio / video /
+          PDF, in declared order.
+        - ``inline_text_block``: concatenated `[attachment_text …]`
+          blocks for small `text/*` attachments. Caller prepends to
+          the user prompt.
+        - ``skipped``: items filtered out (mime not supported, too
+          large, or a download error). Reported back as an
+          `[attachments_skipped]` block.
+
+        Greedy fill: take attachments in declared order until the
+        per-message total cap; subsequent ones are reported as
+        skipped.
+        """
+        parts: list[types.Part] = []
+        text_blocks: list[str] = []
+        skipped: list[DroppedAttachment] = []
+        if not message.attachments:
+            return parts, "", skipped
+
+        per_cap = _attachment_max_bytes()
+        total_cap = _attachments_max_total_bytes()
+        used = 0
+
+        for att in message.attachments:
+            mime = att.content_type or ""
+            is_text = mime.startswith("text/")
+            is_supported_inline = mime in GEMINI_SUPPORTED_MIME_TYPES
+
+            if not (is_text or is_supported_inline):
+                skipped.append(
+                    DroppedAttachment(
+                        filename=att.filename,
+                        mime=mime or None,
+                        size=att.size,
+                        reason="unsupported type",
+                    )
+                )
+                continue
+            if is_text and att.size > TEXT_ATTACHMENT_MAX_BYTES:
+                skipped.append(
+                    DroppedAttachment(
+                        filename=att.filename,
+                        mime=mime,
+                        size=att.size,
+                        reason=(
+                            f"text too large (>{TEXT_ATTACHMENT_MAX_BYTES} bytes)"
+                        ),
+                    )
+                )
+                continue
+            if att.size > per_cap:
+                skipped.append(
+                    DroppedAttachment(
+                        filename=att.filename,
+                        mime=mime,
+                        size=att.size,
+                        reason=(
+                            f"exceeds per-attachment cap ({per_cap} bytes)"
+                        ),
+                    )
+                )
+                continue
+            if used + att.size > total_cap:
+                skipped.append(
+                    DroppedAttachment(
+                        filename=att.filename,
+                        mime=mime,
+                        size=att.size,
+                        reason=(
+                            f"would exceed total cap ({total_cap} bytes)"
+                        ),
+                    )
+                )
+                continue
+
+            try:
+                data = await att.read()
+            except Exception as e:
+                logger.warning(
+                    "Failed to download attachment %s: %s",
+                    att.filename,
+                    e,
+                )
+                skipped.append(
+                    DroppedAttachment(
+                        filename=att.filename,
+                        mime=mime,
+                        size=att.size,
+                        reason=f"download failed: {e}",
+                    )
+                )
+                continue
+
+            used += len(data)
+            if is_text:
+                decoded = data.decode("utf-8", errors="replace")
+                text_blocks.append(
+                    f'[attachment_text filename="{att.filename}"]\n'
+                    f"{decoded}\n"
+                    f"[/attachment_text]\n"
+                )
+            else:
+                parts.append(
+                    types.Part(
+                        inline_data=types.Blob(data=data, mime_type=mime)
+                    )
+                )
+
+        return parts, "\n".join(text_blocks), skipped
+
     async def _on_message(self, message: discord.Message) -> None:
         # Record every guild message into the channel's rolling buffer
         # before any gating — even messages that don't trigger the bot
@@ -483,7 +680,14 @@ class DiscordChannel(ChannelBase):
             if prompt.startswith(mention_name):
                 prompt = prompt[len(mention_name) :].lstrip()
 
-        if not prompt:
+        # Pull attachments before the empty-prompt guard so that an
+        # attachment-only message (e.g. just an image, no text) still
+        # triggers the agent.
+        attach_parts, attach_text, attach_skipped = (
+            await self._collect_attachments(message)
+        )
+
+        if not prompt and not attach_parts and not attach_text and not attach_skipped:
             return
 
         # Build the Origin envelope so the agent knows who/where it's
@@ -532,15 +736,21 @@ class DiscordChannel(ChannelBase):
             else:
                 await message.channel.send(text)
 
+        prompt_with_text_attachments = (
+            attach_text + prompt if attach_text else prompt
+        )
+
         try:
             async with message.channel.typing():
                 response = await self.handle_message(
                     user_id=sender_id,
                     session_id=str(message.channel.id),
-                    message=prompt,
+                    message=prompt_with_text_attachments,
                     origin=origin,
                     reply_to=reply_to,
                     context=context or None,
+                    attachments=attach_parts,
+                    attachments_skipped=attach_skipped,
                 )
         except Exception:
             logger.exception("Agent run failed for Discord message %s", message.id)
