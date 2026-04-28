@@ -371,10 +371,19 @@ class ChannelBase:
         already_named: set[str],
     ) -> list[OutboundFile]:
         """Pull bytes out of the artifact service for each saved
-        artifact this turn. Skips filenames already covered by an
-        inline Part so we don't double-deliver."""
+        artifact this turn.
+
+        Skips filenames already covered by an inline Part so we
+        don't double-deliver. Also skips internal artifacts whose
+        names start with `_` — these are working data the agent
+        needs (e.g. bytes cached by `web_fetch` for the
+        `load_artifacts` tool to surface back to the model) but
+        the user shouldn't receive as a chat attachment.
+        """
         out: list[OutboundFile] = []
         for fname, version in versions.items():
+            if fname.startswith("_"):
+                continue
             sanitized = _sanitize_filename(fname)
             if sanitized in already_named:
                 continue

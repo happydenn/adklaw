@@ -535,29 +535,122 @@ def stub_server() -> Iterator[str]:
         thread.join(timeout=2)
 
 
-def test_web_fetch_happy(stub_server: str) -> None:
+@pytest.mark.asyncio
+async def test_web_fetch_happy(stub_server: str) -> None:
     _StubHandler.body = b"hello world"
     _StubHandler.content_type = "text/plain"
-    result = web_fetch(stub_server)
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
     assert result["status"] == "success"
     assert result["status_code"] == 200
     assert result["text"] == "hello world"
     assert result["truncated"] is False
+    # Text path doesn't touch artifacts.
+    assert ctx.calls == []
 
 
-def test_web_fetch_rejects_non_http() -> None:
-    result = web_fetch("ftp://example.com/")
+@pytest.mark.asyncio
+async def test_web_fetch_rejects_non_http() -> None:
+    ctx = _StubToolContext()
+    result = await web_fetch("ftp://example.com/", ctx)  # type: ignore[arg-type]
     assert result["status"] == "error"
     assert "http" in result["error"].lower()
 
 
-def test_web_fetch_truncates(stub_server: str) -> None:
+@pytest.mark.asyncio
+async def test_web_fetch_truncates(stub_server: str) -> None:
     _StubHandler.body = b"a" * (MAX_FETCH_BYTES + 1000)
     _StubHandler.content_type = "text/plain"
-    result = web_fetch(stub_server)
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["text"]) <= MAX_FETCH_BYTES
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_json_treated_as_text(stub_server: str) -> None:
+    _StubHandler.body = b'{"x": 1}'
+    _StubHandler.content_type = "application/json"
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["text"] == '{"x": 1}'
+    assert "saved_as_artifact" not in result
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_binary_saves_as_artifact(stub_server: str) -> None:
+    payload = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    _StubHandler.body = payload
+    _StubHandler.content_type = "image/png"
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["saved_as_artifact"] is True
+    assert result["mime"] == "image/png"
+    assert result["bytes"] == len(payload)
+    assert result["filename"].startswith("_fetched_")
+    assert result["filename"].endswith(".png")
+    assert "load_artifacts" in result["hint"]
+    # Bytes really did flow into save_artifact.
+    assert len(ctx.calls) == 1
+    saved = ctx.calls[0]["artifact"].inline_data
+    assert saved.data == payload
+    assert saved.mime_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_binary_oversize_errors(stub_server: str) -> None:
+    _StubHandler.body = b"x" * (MAX_FETCH_BYTES + 1000)
+    _StubHandler.content_type = "application/pdf"
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert "too large" in result["error"].lower()
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_unknown_mime_decodes_when_utf8(
+    stub_server: str,
+) -> None:
+    _StubHandler.body = b"hello, world"
+    _StubHandler.content_type = "application/octet-stream"
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["text"] == "hello, world"
+    assert "saved_as_artifact" not in result
+    assert ctx.calls == []
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_unknown_mime_falls_to_binary_when_undecodable(
+    stub_server: str,
+) -> None:
+    _StubHandler.body = b"\xff\xfe\xfd\xfc\x00\x01"
+    _StubHandler.content_type = "application/octet-stream"
+    ctx = _StubToolContext()
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
+    assert result["status"] == "success"
+    assert result["saved_as_artifact"] is True
+    assert result["mime"] == "application/octet-stream"
+    assert result["filename"].startswith("_fetched_")
+    assert result["filename"].endswith(".bin")
+    assert len(ctx.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_save_failure_surfaces_error(stub_server: str) -> None:
+    _StubHandler.body = b"\x89PNG-bytes"
+    _StubHandler.content_type = "image/png"
+    ctx = _StubToolContext()
+    ctx.save_raises = RuntimeError("storage down")
+    result = await web_fetch(stub_server, ctx)  # type: ignore[arg-type]
+    assert result["status"] == "error"
+    assert "storage down" in result["error"]
 
 
 # ---------------------------------------------------------------------------

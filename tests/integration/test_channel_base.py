@@ -423,6 +423,36 @@ async def test_handle_message_dedupes_inline_and_artifact_by_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_message_skips_underscore_prefixed_artifacts() -> None:
+    """Underscore-prefixed artifacts are internal (e.g. `web_fetch`
+    byte caches the model needs to read but the user shouldn't
+    receive). They must not surface as `AgentReply.files`, and we
+    shouldn't even waste a `load_artifact` call on them."""
+    artifacts = _StubArtifactService(
+        entries={
+            ("report.pdf", 1): (b"keep-me", "application/pdf"),
+            ("_fetched_x.png", 1): (b"hide-me", "image/png"),
+        }
+    )
+    runner = _RecordingRunner(
+        events=[
+            _final_text_event("done"),
+            _artifact_event("_fetched_x.png", 1),
+            _artifact_event("report.pdf", 1),
+        ]
+    )
+    ch = _make_channel(runner, artifact_service=artifacts)
+    reply = await ch.handle_message(user_id="u", session_id="s", message="x")
+    assert len(reply.files) == 1
+    assert reply.files[0].filename == "report.pdf"
+    # Internal artifact never read.
+    fetched_calls = [
+        c for c in artifacts.calls if c["filename"] == "_fetched_x.png"
+    ]
+    assert fetched_calls == []
+
+
+@pytest.mark.asyncio
 async def test_handle_message_round_trips_save_artifact_via_real_service() -> None:
     """End-to-end through the real `InMemoryArtifactService`: a tool
     pre-saves bytes, the runner emits an `artifact_delta` event,

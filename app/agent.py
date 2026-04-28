@@ -20,6 +20,7 @@ from google.adk.agents import Agent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.apps import App
 from google.adk.models import Gemini
+from google.adk.tools.load_artifacts_tool import load_artifacts_tool
 from google.genai import types
 
 from .skills import LiveSkillToolset
@@ -94,6 +95,24 @@ For destructive edits (≥30% of bytes or ≥40 lines removed), pass
 `allow_large_deletion=True` only when the deletion is genuinely
 intended.
 
+## Tools — web_fetch (binary content)
+
+`web_fetch` returns inline `text` for HTML / JSON / plain-text
+responses, but binary responses (images, PDFs, audio, video,
+archives) can't be stuffed into a string without corrupting the
+bytes. Those come back as `{"status": "success",
+"saved_as_artifact": true, "filename": "_fetched_…", "mime": …,
+"bytes": …}`.
+
+When you see `saved_as_artifact: true`, call
+`load_artifacts(artifact_names=["<filename from the response>"])`
+in your next tool call. The bytes will be inserted into the
+conversation as a user-role attachment on the turn after that,
+and you can describe / summarise / answer questions about them
+directly. Don't try to summarise a binary based on its `mime`
+and `bytes` alone — `load_artifacts` is the only way to actually
+see the content.
+
 ## Tools — send_workspace_file
 
 If the user asks you to send, share, attach, or give them a file
@@ -166,7 +185,7 @@ def build_app(
         generate_content_config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(thinking_level="medium"),
         ),
-        tools=[*ALL_TOOLS, *extra_tools, skills_toolset],
+        tools=[*ALL_TOOLS, load_artifacts_tool, *extra_tools, skills_toolset],
     )
     return App(root_agent=agent, name=name)
 

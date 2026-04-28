@@ -101,6 +101,21 @@ Results are charged to the same Vertex billing as the main agent
 model. Flash-Lite is cheap (sub-cent per call) — no separate API key
 or service account needed.
 
+### Fetching binary URLs
+
+`web_fetch(url)` returns inline `text` for HTML / JSON / plain-text
+URLs. For binary responses (images, PDFs, audio, video, archives)
+the bytes can't be safely stuffed into a JSON tool result — the
+agent ends up reading mojibake. Instead, the tool saves the bytes
+as an internal session artifact (filename starts with `_fetched_`)
+and returns metadata. The agent then calls
+`load_artifacts(artifact_names=[…])`, which is ADK's built-in
+hand-off — bytes get injected as a real `Part(inline_data=…)` on
+the next turn so the multimodal model can actually see them.
+Internal `_fetched_*` artifacts aren't auto-delivered to the
+channel; they're for the agent's eyes only. Per-fetch cap stays
+at 2 MB.
+
 ### Sending workspace files
 
 `send_workspace_file(path)` attaches a workspace file to the agent's

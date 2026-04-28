@@ -473,15 +473,65 @@ def run_shell(command: str) -> dict:
     )
 
 
-def web_fetch(url: str) -> dict:
+# Mimes Gemini happily reads as plain text. `text/*` is also
+# text-like — checked separately so we don't enumerate every
+# subtype. Anything not in this set falls through to the binary
+# branch (saved as artifact, retrievable via `load_artifacts`).
+_TEXT_LIKE_MIMES: frozenset[str] = frozenset(
+    {
+        "application/json",
+        "application/ld+json",
+        "application/xml",
+        "application/javascript",
+        "application/atom+xml",
+        "application/rss+xml",
+        "application/x-yaml",
+        "application/yaml",
+    }
+)
+
+
+def _is_text_like(content_type: str) -> bool:
+    base = (content_type or "").split(";", 1)[0].strip().lower()
+    if not base:
+        return False
+    return base.startswith("text/") or base in _TEXT_LIKE_MIMES
+
+
+def _fetch_artifact_filename(data: bytes, mime: str) -> str:
+    """Deterministic name for `web_fetch`-saved bytes.
+
+    The leading `_` is the gating signal `ChannelBase` uses to
+    keep these artifacts off the channel outbound path — they're
+    working data the model needs to read, not files we want to
+    mail back to the user. The sha8 lets the agent dedupe across
+    turns: same bytes → same filename → no double-save.
+    """
+    sha8 = hashlib.sha256(data).hexdigest()[:8]
+    ext = mimetypes.guess_extension(mime or "") or ".bin"
+    return f"_fetched_{sha8}{ext}"
+
+
+async def web_fetch(url: str, tool_context: ToolContext) -> dict:
     """Fetch content from an HTTP(S) URL.
+
+    Text-like responses (HTML, JSON, plain text, XML, etc.) are
+    returned inline as `text`. Binary responses (images, PDFs,
+    audio, video, archives) can't be stuffed into a JSON string
+    without corrupting the bytes, so they're saved as a session
+    artifact and you call `load_artifacts(artifact_names=[…])`
+    next to surface the actual bytes for reasoning.
 
     Args:
         url: HTTP or HTTPS URL.
 
     Returns:
-        {"status": "success", "url", "status_code", "content_type", "text"} or
-        an error. Response is truncated at 2 MB.
+        Text path: {"status": "success", "url", "status_code",
+        "content_type", "text", "truncated"}.
+        Binary path: {"status": "success", "url", "status_code",
+        "content_type", "saved_as_artifact": True, "filename",
+        "mime", "bytes", "version", "hint"}. Call
+        `load_artifacts` with the filename next to read it.
     """
     if not url.lower().startswith(("http://", "https://")):
         return _err("Only http:// and https:// URLs are supported.")
@@ -499,19 +549,93 @@ def web_fetch(url: str) -> dict:
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return _err(f"Fetch failed: {e}")
 
+    if _is_text_like(content_type):
+        return _web_fetch_text(url, status_code, content_type, raw)
+
+    base_mime = (content_type or "").split(";", 1)[0].strip().lower()
+    if not base_mime or base_mime == "application/octet-stream":
+        # Mime missing or opaque. Try strict utf-8: if it works,
+        # it's effectively text. Otherwise save as binary.
+        try:
+            text = raw[: MAX_FETCH_BYTES].decode("utf-8")
+        except UnicodeDecodeError:
+            return await _web_fetch_binary(
+                url,
+                status_code,
+                content_type or "application/octet-stream",
+                raw,
+                tool_context,
+            )
+        truncated = len(raw) > MAX_FETCH_BYTES
+        return _ok(
+            url=url,
+            status_code=status_code,
+            content_type=content_type or "text/plain",
+            text=text,
+            truncated=truncated,
+        )
+
+    return await _web_fetch_binary(
+        url, status_code, content_type, raw, tool_context
+    )
+
+
+def _web_fetch_text(
+    url: str, status_code: int, content_type: str, raw: bytes
+) -> dict:
     truncated = len(raw) > MAX_FETCH_BYTES
     if truncated:
         raw = raw[:MAX_FETCH_BYTES]
-    try:
-        text = raw.decode("utf-8", errors="replace")
-    except UnicodeDecodeError:
-        return _err("Response is not decodable as text.")
+    text = raw.decode("utf-8", errors="replace")
     return _ok(
         url=url,
         status_code=status_code,
         content_type=content_type,
         text=text,
         truncated=truncated,
+    )
+
+
+async def _web_fetch_binary(
+    url: str,
+    status_code: int,
+    content_type: str,
+    raw: bytes,
+    tool_context: ToolContext,
+) -> dict:
+    if len(raw) > MAX_FETCH_BYTES:
+        return _err(
+            f"Binary response too large ({len(raw)} bytes > "
+            f"{MAX_FETCH_BYTES}). Cannot fetch."
+        )
+    mime = (content_type or "").split(";", 1)[0].strip() or (
+        "application/octet-stream"
+    )
+    filename = _fetch_artifact_filename(raw, mime)
+    try:
+        version = await tool_context.save_artifact(
+            filename=filename,
+            artifact=types.Part(
+                inline_data=types.Blob(data=raw, mime_type=mime)
+            ),
+        )
+    except Exception as e:
+        logger.exception("save_artifact failed for fetched url %s", url)
+        return _err(f"Failed to save fetched bytes: {e}")
+    return _ok(
+        url=url,
+        status_code=status_code,
+        content_type=content_type,
+        saved_as_artifact=True,
+        filename=filename,
+        mime=mime,
+        bytes=len(raw),
+        version=version,
+        hint=(
+            f'Binary content saved. Call load_artifacts('
+            f'artifact_names=["{filename}"]) on your next turn '
+            "to read it."
+        ),
     )
 
 
