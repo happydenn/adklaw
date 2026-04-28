@@ -3,13 +3,12 @@
 .adk/
 .google-agents-cli/
 
-# Workspace is local-by-default. Only the shipped baseline lives in git:
-# `AGENTS.md` (default agent definition) and `skills/` (curated skills).
-# Everything else the user drops into `workspace/` (notes, scratch files,
-# data) stays local to their machine.
+# Workspace is private-by-default. Only `AGENTS.md` is tracked, so each
+# user's notes, scratch files, downloads, and any private skills they drop
+# into `workspace/skills/` stay local to their machine. Skills shipped with
+# the project live in the top-level `default_skills/` directory instead.
 /workspace/*
 !/workspace/AGENTS.md
-!/workspace/skills/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

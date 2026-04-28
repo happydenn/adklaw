@@ -45,25 +45,34 @@ them through tools when relevant.
 
 ## Skills
 
-The `skills/` subdirectory holds **agent skills** — folders with a
-`SKILL.md` file (YAML frontmatter for `name` + `description`, then a
-markdown body of instructions). The agent automatically lists available
-skills in its system prompt; when one looks relevant it loads the full
-instructions via the `load_skill` tool and follows them.
+Skills are folders with a `SKILL.md` file (YAML frontmatter for `name` +
+`description`, then a markdown body of instructions). The agent
+automatically lists available skills in its system prompt; when one
+looks relevant it loads the full instructions via the `load_skill` tool
+and follows them. A skill can also include `references/`, `assets/`,
+and `scripts/` subfolders that the agent reads on demand. See
+[agentskills.io](https://agentskills.io/specification) for the full
+spec.
 
-A skill can also include `references/`, `assets/`, and `scripts/`
-subfolders that the agent reads on demand. See
-[agentskills.io](https://agentskills.io/specification) for the full spec.
+Skills are loaded from two places:
 
-Add a new skill by creating `skills/<skill-name>/SKILL.md` (the directory
-name must match the `name` in the frontmatter, kebab-case). Edit or
-delete a skill folder freely — changes are picked up on the next message.
+1. **`default_skills/`** at the repo root — shipped with the project,
+   tracked in git. Edit or add skills here to share them with everyone
+   who clones the repo.
+2. **`skills/`** in this workspace — your **private** skills, ignored
+   by git. Drop a skill folder here to use it locally without
+   committing.
+
+A skill in `workspace/skills/` with the same `name` as one in
+`default_skills/` overrides the default for you. Edit or delete folders
+in either location — changes are picked up on the next message.
 
 ## Live reload
 
-Edits to `AGENTS.md`, other top-level `*.md` files, or anything under
-`skills/` take effect on the **next message** — no restart needed. Each
-turn re-reads these files from disk.
+Edits to `AGENTS.md`, other top-level `*.md` files in this workspace,
+or anything under `default_skills/` or `workspace/skills/` take effect
+on the **next message** — no restart needed. Each turn re-reads these
+files from disk.
 
 ## Pointing at a different workspace
 

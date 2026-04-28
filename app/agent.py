@@ -26,7 +26,7 @@ from google.genai import types
 
 from .skills import LiveSkillToolset
 from .tools import ALL_TOOLS
-from .workspace import get_workspace, load_workspace_instructions
+from .workspace import PROJECT_ROOT, get_workspace, load_workspace_instructions
 
 # Default to Vertex AI on GCP. Users running with a Google AI Studio API key
 # can set GOOGLE_GENAI_USE_VERTEXAI=False and GOOGLE_API_KEY in their .env.
@@ -79,10 +79,13 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
     return "\n\n".join(parts)
 
 
-# Live-reloading skills toolset: re-scans `workspace/skills/` on every turn,
-# so dropping in a new skill folder (or editing one) takes effect on the
-# next message without restarting the agent.
-_skills_toolset = LiveSkillToolset(get_workspace() / "skills")
+# Live-reloading skills toolset. Two directories are scanned every turn:
+# - `default_skills/` ships with the project and is tracked in git.
+# - `<workspace>/skills/` is the user's private overlay; user skills with
+#   the same name as a default override it.
+_skills_toolset = LiveSkillToolset(
+    [PROJECT_ROOT / "default_skills", get_workspace() / "skills"]
+)
 
 root_agent = Agent(
     name="root_agent",
