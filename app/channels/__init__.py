@@ -22,6 +22,6 @@ from ._env import load_channel_env
 
 load_channel_env()
 
-from .base import ChannelBase  # noqa: E402  (must follow env load)
+from .base import ChannelBase, Origin  # noqa: E402  (must follow env load)
 
-__all__ = ["ChannelBase"]
+__all__ = ["ChannelBase", "Origin"]

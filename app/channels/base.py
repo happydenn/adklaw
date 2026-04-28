@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from google.adk.apps import App
 from google.adk.events import Event
@@ -29,6 +30,40 @@ from google.adk.utils.context_utils import Aclosing
 from google.genai import types
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Origin:
+    """Stable, transport-agnostic description of where a message came from.
+
+    `transport`, `sender_id`, and `location_id` are mandatory — every
+    sensible chat transport exposes at least an opaque user identifier
+    and an opaque conversation/channel identifier. Display names are
+    optional because some transports (SMS, raw Telegram private chats,
+    WhatsApp Business) don't expose a separate human-readable name.
+    Channels for those leave the displays as `None`; the prelude
+    formatter degrades to bare `id=…` lines.
+    """
+
+    transport: str
+    sender_id: str
+    location_id: str
+    sender_display: str | None = None
+    location_display: str | None = None
+
+
+def _id_label(display: str | None, id_: str) -> str:
+    return f"{display} (id={id_})" if display else f"id={id_}"
+
+
+def _format_origin(o: Origin) -> str:
+    return (
+        "[origin]\n"
+        f"transport: {o.transport}\n"
+        f"sender: {_id_label(o.sender_display, o.sender_id)}\n"
+        f"location: {_id_label(o.location_display, o.location_id)}\n"
+        "[/origin]\n\n"
+    )
 
 
 class ChannelBase:
@@ -78,6 +113,7 @@ class ChannelBase:
         user_id: str,
         session_id: str,
         message: str,
+        origin: Origin | None = None,
     ) -> str:
         """Run one turn of the agent and return its assistant text.
 
@@ -88,13 +124,19 @@ class ChannelBase:
                 consider a conversation boundary (e.g. Discord channel
                 id, Slack thread ts).
             message: The user's plain-text message.
+            origin: Optional structured description of where the
+                message came from. When provided, an `[origin]…[/origin]`
+                prelude is prepended to the user content so the agent
+                can identify the sender and location. Channels build
+                this; CLI / tests can omit it.
 
         Returns:
             The agent's final assistant text. Tool calls and partial
             streaming events are collected internally and excluded from
             the returned string.
         """
-        new_message = types.Content(role="user", parts=[types.Part(text=message)])
+        text = _format_origin(origin) + message if origin else message
+        new_message = types.Content(role="user", parts=[types.Part(text=text)])
         chunks: list[str] = []
         async with self._lock_for(session_id):
             async with Aclosing(

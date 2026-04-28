@@ -117,11 +117,25 @@ Setup:
 
 Behavior:
 
-- DMs: bot always responds.
+- DMs: bot responds (subject to the allowlist below).
 - Server channels: bot only responds when **@-mentioned**.
 - Each Discord channel/thread/DM keeps its own ADK session
   (conversation continuity per location).
 - Sessions persist in `.adklaw/sessions.db` (SQLite) — survives restarts.
+- Every message the agent sees is preceded by an `[origin]…[/origin]`
+  block carrying the sender's Discord display name + ID and the
+  channel/guild label + IDs, so the agent can address you by name and
+  reason about where the message came from.
+
+**Restricting who can DM the bot.** Anyone who shares a server with
+your bot can DM it by default. To lock the bot to specific Discord
+users, set `DISCORD_ALLOWED_USER_IDS=<id1>,<id2>,...` in `.env`. The
+first DM from a non-listed user gets a one-shot reply showing their
+ID so you can add them; subsequent DMs from the same user (and any
+guild mentions from non-allowlisted users) are silently ignored
+until the bot restarts. Find your own Discord user ID by enabling
+Developer Mode in Discord settings → right-click your profile →
+"Copy User ID".
 
 ### Future channels
 

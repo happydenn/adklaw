@@ -21,6 +21,7 @@ Run with:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -28,7 +29,7 @@ from typing import TYPE_CHECKING
 from google.adk.apps import App
 from google.adk.sessions import BaseSessionService
 
-from .base import ChannelBase
+from .base import ChannelBase, Origin
 
 if TYPE_CHECKING:
     import discord
@@ -36,6 +37,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DISCORD_MESSAGE_LIMIT = 2000
+
+
+@functools.cache
+def _allowed_user_ids() -> frozenset[str]:
+    """Return the configured DM allowlist as a frozenset of user IDs.
+
+    Empty (env var unset or blank) means "no allowlist — allow all."
+    Cached for the process lifetime; restart the bot to pick up env
+    changes.
+    """
+    raw = os.environ.get("DISCORD_ALLOWED_USER_IDS", "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
 
 
 class DiscordChannel(ChannelBase):
@@ -57,6 +72,11 @@ class DiscordChannel(ChannelBase):
         intents.message_content = True
         self._client = discord.Client(intents=intents)
         self._token = token
+        # Non-allowlisted DM senders we've already replied to once in
+        # this process. Subsequent DMs from them are silently ignored.
+        # Resets on restart by design — keeps the feature stateless on
+        # disk; the cost is one repeat notice after a bot restart.
+        self._notified_disallowed: set[str] = set()
 
         @self._client.event
         async def on_ready() -> None:
@@ -71,9 +91,31 @@ class DiscordChannel(ChannelBase):
         if message.author.bot:
             return
 
+        is_dm = message.guild is None
+        sender_id = str(message.author.id)
+
+        # Allowlist gate. Empty allowlist means "allow all" (default).
+        # First-time non-allowed DMs get one polite reply telling the
+        # operator how to add the user; everything else is silent.
+        allowed = _allowed_user_ids()
+        if allowed and sender_id not in allowed:
+            if is_dm and sender_id not in self._notified_disallowed:
+                self._notified_disallowed.add(sender_id)
+                await message.reply(
+                    f"You are not on the DM allowlist. Add `{sender_id}` "
+                    f"to `DISCORD_ALLOWED_USER_IDS` and try again."
+                )
+                logger.info("Notified non-allowlisted DM sender %s", sender_id)
+            else:
+                logger.info(
+                    "Ignoring %s from non-allowlisted user %s",
+                    "DM" if is_dm else f"mention in #{message.channel.name}",
+                    sender_id,
+                )
+            return
+
         # Activation policy: respond in DMs always; in guilds, only when
         # the bot is mentioned. Avoids spamming busy channels.
-        is_dm = message.guild is None
         is_mentioned = self._client.user in message.mentions
         if not is_dm and not is_mentioned:
             return
@@ -90,12 +132,33 @@ class DiscordChannel(ChannelBase):
         if not prompt:
             return
 
+        # Build the Origin envelope so the agent knows who/where it's
+        # talking to. IDs are stable; display names are mutable but
+        # readable for the LLM.
+        if is_dm:
+            location_display = "DM"
+        else:
+            guild_name = message.guild.name if message.guild else "?"
+            location_display = (
+                f"guild '{guild_name}'"
+                + (f" (id={message.guild.id})" if message.guild else "")
+                + f" / channel #{message.channel.name}"
+            )
+        origin = Origin(
+            transport="discord",
+            sender_id=sender_id,
+            sender_display=message.author.display_name,
+            location_id=str(message.channel.id),
+            location_display=location_display,
+        )
+
         try:
             async with message.channel.typing():
                 response = await self.handle_message(
-                    user_id=str(message.author.id),
+                    user_id=sender_id,
                     session_id=str(message.channel.id),
                     message=prompt,
+                    origin=origin,
                 )
         except Exception:
             logger.exception("Agent run failed for Discord message %s", message.id)

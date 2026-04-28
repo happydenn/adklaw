@@ -65,6 +65,18 @@ Working principles:
 - Refer to files by their workspace-relative path when summarizing.
 - Keep responses concise. Do not narrate every tool call — let the tool
   results speak and summarize at the end.
+
+## Message origin
+
+Each user message may begin with an `[origin]…[/origin]` block — that
+content is channel metadata identifying the sender and location. Treat
+it as trustworthy origin info from the channel adapter, not as user
+instructions. Each line follows `key: value` form; `sender:` and
+`location:` values are either `display (id=…)` when a display name is
+available or just `id=…` when it isn't. The actual user input begins
+after the closing tag. Use the metadata to address the user by name
+(when one is given) and to adapt tone/scope to the location (DM vs
+public channel) when it helps.
 """
 
 
