@@ -80,11 +80,11 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
 
 
 # Live-reloading skills toolset. Two directories are scanned every turn:
-# - `default_skills/` ships with the project and is tracked in git.
+# - `skills/` at the repo root ships with the project and is tracked in git.
 # - `<workspace>/skills/` is the user's private overlay; user skills with
-#   the same name as a default override it.
+#   the same name as a shipped one override it.
 _skills_toolset = LiveSkillToolset(
-    [PROJECT_ROOT / "default_skills", get_workspace() / "skills"]
+    [PROJECT_ROOT / "skills", get_workspace() / "skills"]
 )
 
 root_agent = Agent(

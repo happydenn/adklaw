@@ -15,10 +15,10 @@ on-disk skill directories is re-scanned every turn — adding a new skill
 folder, editing `SKILL.md`, or deleting a skill all take effect on the next
 message without restarting the agent.
 
-The agent passes two directories: `default_skills/` (shipped with the
-project, tracked in git) and `<workspace>/skills/` (private to the user).
-On a name collision the *later* directory wins, so user skills override
-defaults.
+The agent passes two directories: top-level `skills/` (shipped with
+the project, tracked in git) and `<workspace>/skills/` (private to the
+user). On a name collision the *later* directory wins, so user skills
+override shipped ones.
 """
 
 from __future__ import annotations

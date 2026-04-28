@@ -56,23 +56,22 @@ spec.
 
 Skills are loaded from two places:
 
-1. **`default_skills/`** at the repo root — shipped with the project,
-   tracked in git. Edit or add skills here to share them with everyone
-   who clones the repo.
-2. **`skills/`** in this workspace — your **private** skills, ignored
-   by git. Drop a skill folder here to use it locally without
-   committing.
+1. **`skills/`** at the repo root — shipped with the project, tracked
+   in git. Edit or add skills here to share them with everyone who
+   clones the repo.
+2. **`workspace/skills/`** — your **private** skills, ignored by git.
+   Drop a skill folder here to use it locally without committing.
 
-A skill in `workspace/skills/` with the same `name` as one in
-`default_skills/` overrides the default for you. Edit or delete folders
-in either location — changes are picked up on the next message.
+A skill in `workspace/skills/` with the same `name` as one in the
+top-level `skills/` overrides the shipped one for you. Edit or delete
+folders in either location — changes are picked up on the next message.
 
 ## Live reload
 
 Edits to `AGENTS.md`, other top-level `*.md` files in this workspace,
-or anything under `default_skills/` or `workspace/skills/` take effect
-on the **next message** — no restart needed. Each turn re-reads these
-files from disk.
+or anything under `skills/` or `workspace/skills/` take effect on the
+**next message** — no restart needed. Each turn re-reads these files
+from disk.
 
 ## Pointing at a different workspace
 
