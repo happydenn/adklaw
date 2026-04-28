@@ -131,11 +131,16 @@ Behavior:
 your bot can DM it by default. To lock the bot to specific Discord
 users, set `DISCORD_ALLOWED_USER_IDS=<id1>,<id2>,...` in `.env`. The
 first DM from a non-listed user gets a one-shot reply showing their
-ID so you can add them; subsequent DMs from the same user (and any
-guild mentions from non-allowlisted users) are silently ignored
-until the bot restarts. Find your own Discord user ID by enabling
-Developer Mode in Discord settings → right-click your profile →
-"Copy User ID".
+ID so you can add them; subsequent DMs from the same user are
+silently ignored until the bot restarts. Find your own Discord user
+ID by enabling Developer Mode in Discord settings → right-click
+your profile → "Copy User ID".
+
+By default the allowlist gates **DMs only** — guild mentions always
+go through (anyone who can @-mention the bot in a server you've
+invited it to is implicitly trusted). To gate guild mentions too,
+set `DISCORD_ALLOWLIST_SCOPE=all`. Valid values are `dm` (default)
+and `all`.
 
 ### Future channels
 

@@ -41,7 +41,7 @@ DISCORD_MESSAGE_LIMIT = 2000
 
 @functools.cache
 def _allowed_user_ids() -> frozenset[str]:
-    """Return the configured DM allowlist as a frozenset of user IDs.
+    """Return the configured allowlist as a frozenset of user IDs.
 
     Empty (env var unset or blank) means "no allowlist — allow all."
     Cached for the process lifetime; restart the bot to pick up env
@@ -51,6 +51,24 @@ def _allowed_user_ids() -> frozenset[str]:
     if not raw:
         return frozenset()
     return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+@functools.cache
+def _allowlist_scope() -> str:
+    """Return how broadly the allowlist applies: "dm" (default) or "all".
+
+    - "dm": only DMs are gated. Guild mentions always bypass the
+      allowlist (anyone who can @-mention the bot in a server you've
+      invited it to is implicitly trusted enough).
+    - "all": both DMs and guild mentions are gated.
+    """
+    raw = os.environ.get("DISCORD_ALLOWLIST_SCOPE", "dm").strip().lower()
+    if raw not in ("dm", "all"):
+        logger.warning(
+            "Unknown DISCORD_ALLOWLIST_SCOPE=%r; defaulting to 'dm'.", raw
+        )
+        return "dm"
+    return raw
 
 
 class DiscordChannel(ChannelBase):
@@ -95,14 +113,20 @@ class DiscordChannel(ChannelBase):
         sender_id = str(message.author.id)
 
         # Allowlist gate. Empty allowlist means "allow all" (default).
+        # `DISCORD_ALLOWLIST_SCOPE` decides whether the allowlist applies
+        # to DMs only ("dm", default) or every surface ("all"). Under "dm",
+        # guild mentions are never gated by the allowlist — they're already
+        # restricted to people who share a server with the bot.
         # First-time non-allowed DMs get one polite reply telling the
         # operator how to add the user; everything else is silent.
         allowed = _allowed_user_ids()
-        if allowed and sender_id not in allowed:
+        scope = _allowlist_scope()
+        gated = (scope == "all") or is_dm
+        if allowed and gated and sender_id not in allowed:
             if is_dm and sender_id not in self._notified_disallowed:
                 self._notified_disallowed.add(sender_id)
                 await message.reply(
-                    f"You are not on the DM allowlist. Add `{sender_id}` "
+                    f"You are not on the allowlist. Add `{sender_id}` "
                     f"to `DISCORD_ALLOWED_USER_IDS` and try again."
                 )
                 logger.info("Notified non-allowlisted DM sender %s", sender_id)
