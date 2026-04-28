@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
+import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from google.adk.apps import App
+from google.adk.artifacts import BaseArtifactService, InMemoryArtifactService
 from google.adk.events import Event
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService
@@ -63,6 +66,39 @@ class ContextMessage:
 
 
 @dataclass(frozen=True)
+class OutboundFile:
+    """A file the agent emitted in this turn that the channel should
+    deliver to the user.
+
+    Sourced from two places by `ChannelBase.handle_message`:
+    `Part(inline_data=Blob(...))` Parts on final-response events
+    (model-emitted), and entries in
+    `event.actions.artifact_delta` (tool-saved via
+    `tool_context.save_artifact`). Both end up here; channels treat
+    them uniformly.
+    """
+
+    filename: str
+    mime: str | None
+    data: bytes
+
+
+@dataclass(frozen=True)
+class AgentReply:
+    """One agent turn's output, in transport-agnostic shape.
+
+    Channels consume this and decide how to deliver: Discord
+    attaches `files` as `discord.File` objects on the same
+    `message.reply(...)`; future Slack / Telegram do the analogous
+    thing. `text` may be empty when the agent's response is purely
+    file output.
+    """
+
+    text: str
+    files: tuple[OutboundFile, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class DroppedAttachment:
     """An attachment the channel saw but couldn't forward to the model.
 
@@ -79,6 +115,32 @@ class DroppedAttachment:
 
 def _id_label(display: str | None, id_: str) -> str:
     return f"{display} (id={id_})" if display else f"id={id_}"
+
+
+_FILENAME_BAD = re.compile(r"[\x00\\/]+")
+
+
+def _sanitize_filename(name: str | None, fallback: str = "file") -> str:
+    """Normalize an outbound filename so transports don't reject it.
+
+    Strips path separators / NULs (path-traversal hygiene), strips
+    leading dots (avoid hidden-file weirdness), and truncates to 100
+    chars. Falls back to `"file"` if the input collapses to empty.
+    """
+    if not name:
+        return fallback
+    n = _FILENAME_BAD.sub("_", name).lstrip(".")[:100]
+    return n or fallback
+
+
+def _synthesize_filename(mime: str | None, idx: int) -> str:
+    """Mint a filename for a model-emitted `inline_data` Part.
+
+    Gemini Parts have no filename slot, so we synthesize one from
+    the mime type. `idx` disambiguates multiple parts in one reply.
+    """
+    ext = mimetypes.guess_extension(mime or "") or ".bin"
+    return f"agent_{idx}{ext}"
 
 
 # Wire format. The agent-side explanation of these blocks lives with
@@ -148,6 +210,7 @@ class ChannelBase:
         self,
         app: App | None = None,
         session_service: BaseSessionService | None = None,
+        artifact_service: BaseArtifactService | None = None,
         *,
         extra_tools: Sequence[Any] = (),
         extra_instruction: str = "",
@@ -172,9 +235,15 @@ class ChannelBase:
             )
         self._app = app
         self._session_service = session_service
+        # Default to in-memory artifacts. The Cloud Run / Vertex deploy
+        # path in `app/fast_api_app.py` builds its own Runner with a
+        # GCS-backed service; channels run in-process, so the simpler
+        # in-memory store is fine for the personal-bot scope.
+        self._artifact_service = artifact_service or InMemoryArtifactService()
         self._runner = Runner(
             app=app,
             session_service=session_service,
+            artifact_service=self._artifact_service,
             auto_create_session=True,
         )
         # session_id -> Lock. All channel work runs on a single asyncio
@@ -206,8 +275,8 @@ class ChannelBase:
         context: list[ContextMessage] | None = None,
         attachments: Sequence[types.Part] = (),
         attachments_skipped: Sequence[DroppedAttachment] = (),
-    ) -> str:
-        """Run one turn of the agent and return its assistant text.
+    ) -> AgentReply:
+        """Run one turn of the agent and return its assistant output.
 
         Args:
             user_id: ADK user_id. Channels pass their native user
@@ -242,9 +311,12 @@ class ChannelBase:
                 dropped.
 
         Returns:
-            The agent's final assistant text. Tool calls and partial
-            streaming events are collected internally and excluded from
-            the returned string.
+            An `AgentReply(text, files)`. `text` is the joined final
+            assistant text; `files` carries any binary output the
+            agent produced this turn — both `Part(inline_data=...)`
+            Parts on final-response events (model-emitted) and
+            artifacts saved via `tool_context.save_artifact(...)`.
+            Tool calls and partial streaming chunks are excluded.
         """
         prefix = (
             (_format_origin(origin) if origin else "")
@@ -257,6 +329,8 @@ class ChannelBase:
         parts.extend(attachments)
         new_message = types.Content(role="user", parts=parts)
         chunks: list[str] = []
+        inline_files: list[OutboundFile] = []
+        artifact_versions: dict[str, int] = {}
         async with self._lock_for(session_id):
             async with Aclosing(
                 self._runner.run_async(
@@ -266,25 +340,102 @@ class ChannelBase:
                 )
             ) as events:
                 async for event in events:
-                    text = _final_text(event)
-                    if text:
-                        chunks.append(text)
-        return "".join(chunks).strip()
+                    chunk_text, new_inline = _collect_event(
+                        event, len(inline_files)
+                    )
+                    if chunk_text:
+                        chunks.append(chunk_text)
+                    inline_files.extend(new_inline)
+                    if event.actions and event.actions.artifact_delta:
+                        # Last write wins: the final version per
+                        # filename is what we should load.
+                        artifact_versions.update(event.actions.artifact_delta)
+
+        artifact_files = await self._load_artifact_files(
+            user_id=user_id,
+            session_id=session_id,
+            versions=artifact_versions,
+            already_named={f.filename for f in inline_files},
+        )
+        return AgentReply(
+            text="".join(chunks).strip(),
+            files=tuple(inline_files + artifact_files),
+        )
+
+    async def _load_artifact_files(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        versions: dict[str, int],
+        already_named: set[str],
+    ) -> list[OutboundFile]:
+        """Pull bytes out of the artifact service for each saved
+        artifact this turn. Skips filenames already covered by an
+        inline Part so we don't double-deliver."""
+        out: list[OutboundFile] = []
+        for fname, version in versions.items():
+            sanitized = _sanitize_filename(fname)
+            if sanitized in already_named:
+                continue
+            try:
+                part = await self._artifact_service.load_artifact(
+                    app_name=self._app.name,
+                    user_id=user_id,
+                    session_id=session_id,
+                    filename=fname,
+                    version=version,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to load artifact %s v%s", fname, version
+                )
+                continue
+            if (
+                part is None
+                or not part.inline_data
+                or not part.inline_data.data
+            ):
+                continue
+            out.append(
+                OutboundFile(
+                    filename=sanitized,
+                    mime=part.inline_data.mime_type,
+                    data=bytes(part.inline_data.data),
+                )
+            )
+        return out
 
 
-def _final_text(event: Event) -> str:
-    """Pull plain text out of an event if it is a final assistant response.
+def _collect_event(
+    event: Event, inline_offset: int
+) -> tuple[str, list[OutboundFile]]:
+    """Pull text and `inline_data` Parts out of a final-response event.
 
-    Returns an empty string for tool calls, tool responses, partial
-    streaming chunks, and code-execution results — those should not be
-    surfaced verbatim to channel users.
+    Returns `("", [])` for tool calls, tool responses, partial
+    streaming chunks, and code-execution events — those should not
+    be surfaced verbatim to channel users. `inline_offset` is the
+    number of inline files already collected this turn, used to
+    keep synthesized filenames unique across events.
     """
     if not event.is_final_response():
-        return ""
+        return "", []
     if not event.content or not event.content.parts:
-        return ""
-    parts: list[str] = []
+        return "", []
+    text_chunks: list[str] = []
+    inline: list[OutboundFile] = []
     for part in event.content.parts:
         if part.text:
-            parts.append(part.text)
-    return "".join(parts)
+            text_chunks.append(part.text)
+        elif part.inline_data and part.inline_data.data:
+            inline.append(
+                OutboundFile(
+                    filename=_synthesize_filename(
+                        part.inline_data.mime_type,
+                        inline_offset + len(inline),
+                    ),
+                    mime=part.inline_data.mime_type,
+                    data=bytes(part.inline_data.data),
+                )
+            )
+    return "".join(text_chunks), inline

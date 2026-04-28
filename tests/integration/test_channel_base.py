@@ -15,10 +15,15 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.genai import types
 
-from app.channels.base import ChannelBase, ContextMessage, DroppedAttachment, Origin
+from app.channels.base import (
+    ChannelBase,
+    ContextMessage,
+    DroppedAttachment,
+    Origin,
+)
 
 
 def _final_text_event(text: str) -> Event:
@@ -32,9 +37,20 @@ def _final_text_event(text: str) -> Event:
 class _RecordingRunner:
     """Stub Runner that yields a fixed event stream and records call args."""
 
-    def __init__(self, *, events: list[Event] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        events: list[Event] | None = None,
+        app: Any = None,
+        session_service: Any = None,
+        artifact_service: Any = None,
+        auto_create_session: bool = True,
+    ) -> None:
         self._events = events or [_final_text_event("hello")]
         self.calls: list[dict[str, Any]] = []
+        self.app = app
+        self.session_service = session_service
+        self.artifact_service = artifact_service
 
     def run_async(
         self, *, user_id: str, session_id: str, new_message: types.Content
@@ -55,23 +71,28 @@ class _RecordingRunner:
         return _gen()
 
 
-def _make_channel(runner: Any) -> ChannelBase:
+def _make_channel(
+    runner: Any, artifact_service: Any | None = None
+) -> ChannelBase:
     ch = ChannelBase.__new__(ChannelBase)
     ch._app = MagicMock()
+    ch._app.name = "test-app"
     ch._session_service = MagicMock()
+    ch._artifact_service = artifact_service or MagicMock()
     ch._runner = runner
     ch._session_locks = {}
     return ch
 
 
 @pytest.mark.asyncio
-async def test_handle_message_runs_runner_returns_string() -> None:
+async def test_handle_message_runs_runner_returns_agent_reply() -> None:
     runner = _RecordingRunner(events=[_final_text_event("hello")])
     ch = _make_channel(runner)
     out = await ch.handle_message(
         user_id="u1", session_id="s1", message="hi"
     )
-    assert out == "hello"
+    assert out.text == "hello"
+    assert out.files == ()
     assert len(runner.calls) == 1
 
 
@@ -270,6 +291,158 @@ async def test_handle_message_renders_skipped_block() -> None:
     assert text.endswith("take a look")
 
 
+def _file_event(filename: str, mime: str, data: bytes) -> Event:
+    """Build a final-response Event whose content has an `inline_data`
+    Part — what the model emits when it produces a binary asset."""
+    return Event(
+        author="root_agent",
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    inline_data=types.Blob(data=data, mime_type=mime),
+                ),
+            ],
+        ),
+    )
+
+
+def _artifact_event(filename: str, version: int) -> Event:
+    """Build a non-final event that signals a tool saved an artifact."""
+    return Event(
+        author="root_agent",
+        actions=EventActions(artifact_delta={filename: version}),
+    )
+
+
+class _StubArtifactService:
+    """Minimal `BaseArtifactService` for tests. `entries[(filename,
+    version)] = bytes` provides the bytes returned by load_artifact."""
+
+    def __init__(self, entries: dict[tuple[str, int], tuple[bytes, str]]) -> None:
+        self._entries = entries
+        self.calls: list[dict[str, Any]] = []
+
+    async def load_artifact(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        session_id: str,
+        filename: str,
+        version: int | None = None,
+    ) -> Any:
+        self.calls.append(
+            {
+                "app_name": app_name,
+                "user_id": user_id,
+                "session_id": session_id,
+                "filename": filename,
+                "version": version,
+            }
+        )
+        key = (filename, version or 0)
+        if key not in self._entries:
+            return None
+        data, mime = self._entries[key]
+        return types.Part(inline_data=types.Blob(data=data, mime_type=mime))
+
+
+@pytest.mark.asyncio
+async def test_handle_message_collects_inline_data_parts() -> None:
+    """Inline `Part(inline_data=...)` on a final event surfaces as
+    an `OutboundFile` with a synthesized filename."""
+    runner = _RecordingRunner(
+        events=[
+            _final_text_event("here you go: "),
+            _file_event("ignored", "image/png", b"\x89PNG-bytes"),
+        ]
+    )
+    ch = _make_channel(runner)
+    reply = await ch.handle_message(user_id="u", session_id="s", message="draw a duck")
+    assert reply.text == "here you go:"
+    assert len(reply.files) == 1
+    f = reply.files[0]
+    assert f.data == b"\x89PNG-bytes"
+    assert f.mime == "image/png"
+    assert f.filename.startswith("agent_")
+    assert f.filename.endswith(".png")
+
+
+@pytest.mark.asyncio
+async def test_handle_message_collects_artifacts_from_delta() -> None:
+    """When a tool saves an artifact, the delta entry on the event
+    drives a `load_artifact` call against the registered service
+    and the bytes surface as an `OutboundFile`."""
+    artifacts = _StubArtifactService(
+        entries={("chart.png", 1): (b"chart-bytes", "image/png")}
+    )
+    runner = _RecordingRunner(
+        events=[
+            _artifact_event("chart.png", 1),
+            _final_text_event("done"),
+        ]
+    )
+    ch = _make_channel(runner, artifact_service=artifacts)
+    reply = await ch.handle_message(user_id="u", session_id="s", message="render")
+    assert reply.text == "done"
+    assert len(reply.files) == 1
+    assert reply.files[0].filename == "chart.png"
+    assert reply.files[0].data == b"chart-bytes"
+    assert reply.files[0].mime == "image/png"
+    # And the service got called with the right (app, user, session, filename, version).
+    assert artifacts.calls == [
+        {
+            "app_name": "test-app",
+            "user_id": "u",
+            "session_id": "s",
+            "filename": "chart.png",
+            "version": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_dedupes_inline_and_artifact_by_name() -> None:
+    """If an inline Part and an artifact share a sanitized filename,
+    keep the inline copy and skip the artifact load — same byte
+    payload, no point delivering twice."""
+    artifacts = _StubArtifactService(
+        entries={("agent_0.png", 1): (b"artifact-bytes", "image/png")}
+    )
+    runner = _RecordingRunner(
+        events=[
+            _file_event("inline", "image/png", b"inline-bytes"),
+            _artifact_event("agent_0.png", 1),
+        ]
+    )
+    ch = _make_channel(runner, artifact_service=artifacts)
+    reply = await ch.handle_message(user_id="u", session_id="s", message="x")
+    assert len(reply.files) == 1
+    assert reply.files[0].data == b"inline-bytes"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_swallows_artifact_load_failures() -> None:
+    """A load_artifact crash shouldn't kill the whole reply — log,
+    skip the artifact, return whatever else we collected."""
+
+    class _FailingService:
+        async def load_artifact(self, **kwargs: Any) -> Any:
+            raise RuntimeError("storage down")
+
+    runner = _RecordingRunner(
+        events=[
+            _final_text_event("here"),
+            _artifact_event("broken.png", 1),
+        ]
+    )
+    ch = _make_channel(runner, artifact_service=_FailingService())
+    reply = await ch.handle_message(user_id="u", session_id="s", message="x")
+    assert reply.text == "here"
+    assert reply.files == ()
+
+
 @pytest.mark.asyncio
 async def test_handle_message_serializes_same_session() -> None:
     """Three concurrent calls on one session_id must run one-at-a-time."""
@@ -321,7 +494,14 @@ async def test_channel_base_with_extras_builds_app(
     captured: dict[str, Any] = {}
 
     class _StubRunner:
-        def __init__(self, *, app: Any, session_service: Any, auto_create_session: bool):
+        def __init__(
+            self,
+            *,
+            app: Any,
+            session_service: Any,
+            artifact_service: Any = None,
+            auto_create_session: bool,
+        ):
             captured["app"] = app
 
     monkeypatch.setattr(base_module, "Runner", _StubRunner)

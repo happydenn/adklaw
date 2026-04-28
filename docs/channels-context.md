@@ -242,6 +242,43 @@ No on-disk cache.
 the referenced message's attachments doubles the download budget
 question; defer until there's a concrete need.
 
+### Outbound (agent → user)
+
+The reverse direction is symmetric. `ChannelBase.handle_message`
+returns an `AgentReply(text, files)` instead of plain text; each
+file is an `OutboundFile(filename, mime, data)` with bytes ready
+to ship. Two collection paths feed it:
+
+1. **Inline `Part(inline_data=...)`** on `is_final_response()`
+   events. The model can emit binary parts directly (native
+   image generation, etc.). Filenames are synthesized as
+   `agent_<n>.<ext>` from the mime type since Gemini Parts have
+   no filename slot.
+
+2. **Artifacts.** `ChannelBase` registers a
+   `BaseArtifactService` (in-memory default; the Cloud Run /
+   Vertex deploy in `app/fast_api_app.py` builds its own with
+   `gs://…`) on the `Runner`. Any tool that calls
+   `tool_context.save_artifact(filename, Part(...))` produces an
+   `event.actions.artifact_delta` entry; after the run, channels
+   load the saved bytes by filename + version. Filenames sourced
+   here are sanitized at the channel boundary (path separators
+   stripped, leading dots dropped, truncated to 100 chars).
+
+Inline and artifact sources dedup by filename — if both surface
+the same name, the inline copy wins (no double delivery).
+
+Discord-specific delivery: files ride on the same
+`message.reply(...)` / `channel.send(...)` call as the text via
+`discord.File(fp=BytesIO(data), filename=...)`. Discord caps at
+10 files per message; we batch overflow into follow-up
+`channel.send` messages. Per-file size is capped by
+`DISCORD_OUTBOUND_FILE_MAX_BYTES` (default 25 MB); oversize files
+are dropped with a `(skipped …: too large)` line appended to the
+reply so the agent can explain. A transient send failure (CDN
+hiccup) falls back to text-only with a `(could not attach …)`
+note rather than swallowing the whole reply.
+
 ## Transport-agnostic seam
 
 The `ContextMessage(sender_id, text, sender_display=None)` dataclass

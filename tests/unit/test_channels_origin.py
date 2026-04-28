@@ -8,14 +8,18 @@ import dataclasses
 import pytest
 
 from app.channels.base import (
+    AgentReply,
     ContextMessage,
     DroppedAttachment,
     Origin,
+    OutboundFile,
     _format_attachments_skipped,
     _format_context,
     _format_origin,
     _format_reply_to,
     _id_label,
+    _sanitize_filename,
+    _synthesize_filename,
 )
 
 
@@ -146,6 +150,55 @@ def test_format_attachments_skipped_renders_block() -> None:
     assert "huge.mp4" in out
     assert "1.5 MB" in out
     assert "50.0 MB" in out
+
+
+def test_outbound_file_is_frozen() -> None:
+    f = OutboundFile(filename="x.png", mime="image/png", data=b"\x89PNG")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        f.filename = "y.png"  # type: ignore[misc]
+
+
+def test_agent_reply_default_files_empty() -> None:
+    r = AgentReply(text="hi")
+    assert r.files == ()
+
+
+def test_agent_reply_is_frozen() -> None:
+    r = AgentReply(text="hi")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        r.text = "bye"  # type: ignore[misc]
+
+
+def test_sanitize_filename_strips_path_separators() -> None:
+    # forward + back slashes and NULs all collapse to underscores.
+    assert _sanitize_filename("a/b\\c\x00.png") == "a_b_c_.png"
+
+
+def test_sanitize_filename_strips_leading_dots() -> None:
+    assert _sanitize_filename("...secret") == "secret"
+
+
+def test_sanitize_filename_truncates_to_100() -> None:
+    name = "x" * 200
+    out = _sanitize_filename(name)
+    assert len(out) == 100
+    assert out == "x" * 100
+
+
+def test_sanitize_filename_falls_back_for_empty() -> None:
+    assert _sanitize_filename("") == "file"
+    assert _sanitize_filename(None) == "file"
+
+
+def test_synthesize_filename_uses_mime_extension() -> None:
+    name = _synthesize_filename("image/png", 0)
+    assert name.startswith("agent_0")
+    assert name.endswith(".png")
+
+
+def test_synthesize_filename_falls_back_to_bin_for_unknown_mime() -> None:
+    assert _synthesize_filename(None, 3) == "agent_3.bin"
+    assert _synthesize_filename("application/x-not-real", 3).endswith(".bin")
 
 
 def test_format_attachments_skipped_handles_unknown_mime() -> None:

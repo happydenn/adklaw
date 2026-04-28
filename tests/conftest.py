@@ -49,6 +49,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
         _attachment_max_bytes,
         _attachments_max_total_bytes,
         _history_limit,
+        _outbound_file_max_bytes,
         _quote_bot_replies,
         _reply_to_bots,
     )
@@ -59,6 +60,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     _attachment_max_bytes.cache_clear()
     _attachments_max_total_bytes.cache_clear()
     _history_limit.cache_clear()
+    _outbound_file_max_bytes.cache_clear()
     _quote_bot_replies.cache_clear()
     _reply_to_bots.cache_clear()
     _web_search_client.cache_clear()
@@ -71,6 +73,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
         "DISCORD_ATTACHMENT_MAX_BYTES",
         "DISCORD_ATTACHMENTS_MAX_TOTAL_BYTES",
         "DISCORD_CONTEXT_HISTORY_LINES",
+        "DISCORD_OUTBOUND_FILE_MAX_BYTES",
         "DISCORD_QUOTE_BOT_REPLIES",
         "DISCORD_REPLY_TO_BOTS",
         "ADKLAW_WEB_SEARCH_LATLNG",

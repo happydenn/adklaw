@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.channels import base as base_module
-from app.channels.base import Origin
+from app.channels.base import AgentReply, Origin, OutboundFile
 from app.channels.discord import DiscordChannel
 
 # ---------------------------------------------------------------------------
@@ -77,6 +77,8 @@ class _FakeChannel:
     history_calls: list[dict[str, Any]] = field(default_factory=list)
     history_raises: BaseException | None = None
     sends: list[str] = field(default_factory=list)
+    sends_full: list[dict[str, Any]] = field(default_factory=list)
+    send_raises: BaseException | None = None
     fetched: dict[int, Any] = field(default_factory=dict)
     fetch_calls: list[int] = field(default_factory=list)
     fetch_raises: BaseException | None = None
@@ -88,11 +90,26 @@ class _FakeChannel:
 
         return _cm()
 
-    async def send(self, text: str) -> None:
+    async def send(
+        self, text: str, *, files: list[Any] | None = None
+    ) -> None:
         """Mimic `discord.TextChannel.send` — records each call so tests
         can assert the response went out as a plain channel message
-        (no `MessageReference`) rather than a quoted reply."""
+        (no `MessageReference`) rather than a quoted reply.
+
+        `sends` keeps the legacy text-only list (backwards compatible
+        with existing assertions); `sends_full` records the full
+        kwargs so tests can inspect attached files. `send_raises` is
+        one-shot — it fires on the next call then clears itself, so
+        tests can simulate a transient failure without poisoning the
+        fallback retry.
+        """
         self.sends.append(text)
+        self.sends_full.append({"text": text, "files": files or []})
+        if self.send_raises is not None:
+            exc = self.send_raises
+            self.send_raises = None
+            raise exc
 
     async def fetch_message(self, msg_id: int) -> Any:
         """Mimic `discord.TextChannel.fetch_message` — looks up by id in
@@ -127,19 +144,36 @@ class _FakeMessage:
     guild: _FakeGuild | None = None
     mentions: list[Any] = field(default_factory=list)
     replies: list[str] = field(default_factory=list)
+    replies_full: list[dict[str, Any]] = field(default_factory=list)
+    reply_raises: BaseException | None = None
     reference: _FakeReference | None = None
     attachments: list[_FakeAttachment] = field(default_factory=list)
 
-    async def reply(self, text: str) -> None:
+    async def reply(
+        self, text: str, *, files: list[Any] | None = None
+    ) -> None:
         self.replies.append(text)
+        self.replies_full.append({"text": text, "files": files or []})
+        if self.reply_raises is not None:
+            exc = self.reply_raises
+            self.reply_raises = None
+            raise exc
 
 
 class _StubRunner:
     """No-op Runner replacement so ChannelBase can be constructed without ADK."""
 
-    def __init__(self, *, app: Any, session_service: Any, auto_create_session: bool):
+    def __init__(
+        self,
+        *,
+        app: Any,
+        session_service: Any,
+        artifact_service: Any = None,
+        auto_create_session: bool,
+    ):
         self.app = app
         self.session_service = session_service
+        self.artifact_service = artifact_service
 
 
 @pytest.fixture
@@ -172,7 +206,9 @@ def channel(monkeypatch: pytest.MonkeyPatch) -> DiscordChannel:
         monkeypatch.setattr(discord, "Client", real_client_cls)
 
     # Replace handle_message with an AsyncMock so we can assert on call args.
-    ch.handle_message = AsyncMock(return_value="agent reply")  # type: ignore[method-assign]
+    ch.handle_message = AsyncMock(  # type: ignore[method-assign]
+        return_value=AgentReply(text="agent reply", files=())
+    )
     return ch
 
 
@@ -1314,3 +1350,189 @@ async def test_no_attachments_no_extra_block(
     kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
     assert kwargs["attachments"] == []
     assert kwargs["attachments_skipped"] == []
+
+
+# ---------------------------------------------------------------------------
+# Outbound files (agent → Discord)
+# ---------------------------------------------------------------------------
+
+
+def _stub_reply(
+    channel: DiscordChannel,
+    text: str,
+    files: tuple[OutboundFile, ...] = (),
+) -> None:
+    """Override the channel's stubbed `handle_message` so the agent
+    appears to return `(text, files)` on the next dispatch."""
+    channel.handle_message = AsyncMock(  # type: ignore[method-assign]
+        return_value=AgentReply(text=text, files=files)
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbound_text_plus_one_file_single_send(
+    channel: DiscordChannel,
+) -> None:
+    _stub_reply(
+        channel,
+        "here you go",
+        (OutboundFile(filename="duck.png", mime="image/png", data=b"\x89PNG"),),
+    )
+    msg = _make_message(sender_id=1, content="draw a duck", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    # Single quoted reply with both text and one file.
+    assert len(msg.replies_full) == 1
+    assert msg.replies_full[0]["text"] == "here you go"
+    files = msg.replies_full[0]["files"]
+    assert len(files) == 1
+    assert files[0].filename == "duck.png"
+    assert msg.channel.sends == []
+
+
+@pytest.mark.asyncio
+async def test_outbound_file_only_single_send(
+    channel: DiscordChannel,
+) -> None:
+    _stub_reply(
+        channel,
+        "",
+        (OutboundFile(filename="x.bin", mime=None, data=b"data"),),
+    )
+    msg = _make_message(sender_id=1, content="hi", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    assert len(msg.replies_full) == 1
+    assert msg.replies_full[0]["text"] == ""
+    assert len(msg.replies_full[0]["files"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_outbound_files_batched_in_groups_of_ten(
+    channel: DiscordChannel,
+) -> None:
+    files = tuple(
+        OutboundFile(
+            filename=f"f{i}.bin",
+            mime="application/octet-stream",
+            data=f"d{i}".encode(),
+        )
+        for i in range(12)
+    )
+    _stub_reply(channel, "twelve files", files)
+    msg = _make_message(sender_id=1, content="dump", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+
+    # First 10 ride on the quoted reply with the text; remaining 2 go
+    # via channel.send as a files-only follow-up.
+    assert len(msg.replies_full) == 1
+    assert msg.replies_full[0]["text"] == "twelve files"
+    assert len(msg.replies_full[0]["files"]) == 10
+
+    assert len(msg.channel.sends_full) == 1
+    assert msg.channel.sends_full[0]["text"] == ""
+    assert len(msg.channel.sends_full[0]["files"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_outbound_oversized_file_dropped_with_note(
+    channel: DiscordChannel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_OUTBOUND_FILE_MAX_BYTES", "1000")
+    # Re-import to clear the cache picked up by the autouse fixture.
+    from app.channels.discord import _outbound_file_max_bytes
+
+    _outbound_file_max_bytes.cache_clear()
+
+    huge = OutboundFile(
+        filename="huge.bin",
+        mime="application/octet-stream",
+        data=b"x" * 5000,
+    )
+    _stub_reply(channel, "see attached", (huge,))
+    msg = _make_message(sender_id=1, content="give me the file", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    assert len(msg.replies_full) == 1
+    assert msg.replies_full[0]["files"] == []
+    assert "(skipped huge.bin: too large)" in msg.replies_full[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_outbound_filename_sanitized_at_send_boundary(
+    channel: DiscordChannel,
+) -> None:
+    bad = OutboundFile(
+        filename="../../etc/passwd",
+        mime="text/plain",
+        data=b"bytes",
+    )
+    _stub_reply(channel, "", (bad,))
+    msg = _make_message(sender_id=1, content="x", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    files = msg.replies_full[0]["files"]
+    assert len(files) == 1
+    name = files[0].filename
+    assert "/" not in name
+    assert "\\" not in name
+    assert not name.startswith(".")
+
+
+@pytest.mark.asyncio
+async def test_outbound_to_bot_uses_channel_send_with_files(
+    channel: DiscordChannel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bot-authored messages skip the quoted reply (loop avoidance);
+    files still attach, just on `channel.send` instead of
+    `message.reply`."""
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "true")
+    from app.channels.discord import _reply_to_bots
+
+    _reply_to_bots.cache_clear()
+
+    _stub_reply(
+        channel,
+        "ack",
+        (OutboundFile(filename="a.bin", mime=None, data=b"x"),),
+    )
+    msg = _make_message(
+        sender_id=1, content="hi", is_dm=True, bot=True
+    )
+    msg.author.id = 12345  # not the bot's own id
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    # No quoted reply.
+    assert msg.replies_full == []
+    # First (and only) send is on channel, with the file.
+    assert len(msg.channel.sends_full) == 1
+    assert msg.channel.sends_full[0]["text"] == "ack"
+    assert len(msg.channel.sends_full[0]["files"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_outbound_reply_failure_falls_back_to_text(
+    channel: DiscordChannel,
+) -> None:
+    _stub_reply(
+        channel,
+        "see attached",
+        (OutboundFile(filename="ok.bin", mime=None, data=b"x"),),
+    )
+    msg = _make_message(sender_id=1, content="x", is_dm=True)
+    # First reply attempt (with files) raises; fallback retries
+    # text-only on the same `reply()` path.
+    msg.reply_raises = RuntimeError("CDN hiccup")
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    # Two reply attempts: one raised, one succeeded with the
+    # fallback text. Both are recorded by `_FakeMessage`.
+    assert len(msg.replies_full) == 2
+    assert "(could not attach ok.bin)" in msg.replies_full[1]["text"]
+    assert msg.replies_full[1]["files"] == []
+
+
+@pytest.mark.asyncio
+async def test_outbound_empty_response_says_no_response(
+    channel: DiscordChannel,
+) -> None:
+    _stub_reply(channel, "", ())
+    msg = _make_message(sender_id=1, content="x", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    assert msg.replies == ["(no response)"]

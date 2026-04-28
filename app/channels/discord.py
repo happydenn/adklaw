@@ -15,18 +15,33 @@ from __future__ import annotations
 
 import collections
 import functools
+import io
 import logging
 import os
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
 
 from google.adk.apps import App
 from google.adk.sessions import BaseSessionService
 from google.genai import types
 
-from .base import ChannelBase, ContextMessage, DroppedAttachment, Origin
+from .base import (
+    AgentReply,
+    ChannelBase,
+    ContextMessage,
+    DroppedAttachment,
+    Origin,
+    OutboundFile,
+    _sanitize_filename,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     import discord
+
+    _FirstSender = Callable[..., Awaitable[None]]
+    _FollowSender = Callable[..., Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +231,35 @@ def _attachments_max_total_bytes() -> int:
             DEFAULT_ATTACHMENTS_MAX_TOTAL_BYTES,
         )
         return DEFAULT_ATTACHMENTS_MAX_TOTAL_BYTES
+
+
+# Discord caps for outbound files. The hard limits come from Discord
+# itself (≤10 files per message, ~25 MB per non-Nitro upload); the env
+# knob lets you tighten the per-file size locally.
+DISCORD_FILES_PER_MESSAGE = 10
+DEFAULT_OUTBOUND_FILE_MAX_BYTES = 25_000_000
+
+
+@functools.cache
+def _outbound_file_max_bytes() -> int:
+    """Largest single file we'll attach to a Discord message.
+
+    Configurable via `DISCORD_OUTBOUND_FILE_MAX_BYTES`. Files larger
+    than this are dropped with a `(skipped …)` note appended to the
+    text instead of failing the whole reply.
+    """
+    raw = os.environ.get("DISCORD_OUTBOUND_FILE_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_OUTBOUND_FILE_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid DISCORD_OUTBOUND_FILE_MAX_BYTES=%r; defaulting to %d.",
+            raw,
+            DEFAULT_OUTBOUND_FILE_MAX_BYTES,
+        )
+        return DEFAULT_OUTBOUND_FILE_MAX_BYTES
 
 
 # Channel-specific instruction segment passed into `build_app(
@@ -616,6 +660,70 @@ class DiscordChannel(ChannelBase):
 
         return parts, "\n".join(text_blocks), skipped
 
+    async def _dispatch_reply(
+        self,
+        reply: AgentReply,
+        send_first: _FirstSender,
+        send_follow: _FollowSender,
+    ) -> None:
+        """Deliver an `AgentReply` to Discord, handling text chunking,
+        file batching, and the empty-response case.
+
+        The first emitted message reuses whichever send mode the
+        caller picked (quoted reply for humans, plain `channel.send`
+        for bots). Follow-up messages always go through
+        `channel.send` — pinning every chunk back to the original
+        message would be noisy.
+
+        File-attach failures fall back to text-only with a
+        `(could not attach …)` note so a bad CDN moment doesn't
+        eat the whole reply.
+        """
+        text = reply.text
+        files, skipped_notes = _to_discord_files(reply.files)
+        if skipped_notes:
+            text = (text + "\n" + "\n".join(skipped_notes)).strip()
+
+        if not text and not files:
+            await send_first("(no response)")
+            return
+
+        text_chunks = _split_for_discord(text) if text else [""]
+        file_batches = list(_batched(files, DISCORD_FILES_PER_MESSAGE)) or [[]]
+
+        # Pair the first text chunk with the first file batch on a
+        # single send. Remaining text chunks go out as plain
+        # follow-ups; remaining file batches go out as files-only
+        # follow-ups.
+        first_text, *rest_text = text_chunks
+        first_files, *rest_files = file_batches
+
+        try:
+            await send_first(first_text, first_files or None)
+        except Exception:
+            logger.exception(
+                "Failed to send Discord reply with files; falling back to text-only."
+            )
+            note = ""
+            if first_files:
+                names = ", ".join(_filename_of(f) for f in first_files)
+                note = f"\n(could not attach {names})"
+            await send_first((first_text + note).strip() or "(no response)")
+            rest_files = []  # don't keep retrying file sends after a failure
+
+        for chunk in rest_text:
+            await send_follow(chunk)
+        for batch in rest_files:
+            try:
+                await send_follow("", batch)
+            except Exception:
+                names = ", ".join(_filename_of(f) for f in batch)
+                logger.exception(
+                    "Failed to send Discord follow-up with files (%s).",
+                    names,
+                )
+                await send_follow(f"(could not attach {names})")
+
     async def _on_message(self, message: discord.Message) -> None:
         # Record every guild message into the channel's rolling buffer
         # before any gating — even messages that don't trigger the bot
@@ -730,11 +838,28 @@ class DiscordChannel(ChannelBase):
         author_is_bot = message.author.bot
         use_quoted_reply = (not author_is_bot) or _quote_bot_replies()
 
-        async def _send(text: str) -> None:
+        # The first message of a multi-part reply uses the quoted-reply
+        # mechanic (or `channel.send` for bots); follow-up messages
+        # always go through `channel.send` so we don't pin every chunk
+        # back to the original message.
+        async def _send_first(
+            text: str, files: list[discord.File] | None = None
+        ) -> None:
+            kwargs: dict[str, object] = {}
+            if files:
+                kwargs["files"] = files
             if use_quoted_reply:
-                await message.reply(text)
+                await message.reply(text, **kwargs)
             else:
-                await message.channel.send(text)
+                await message.channel.send(text, **kwargs)
+
+        async def _send_follow(
+            text: str, files: list[discord.File] | None = None
+        ) -> None:
+            kwargs: dict[str, object] = {}
+            if files:
+                kwargs["files"] = files
+            await message.channel.send(text, **kwargs)
 
         prompt_with_text_attachments = (
             attach_text + prompt if attach_text else prompt
@@ -742,7 +867,7 @@ class DiscordChannel(ChannelBase):
 
         try:
             async with message.channel.typing():
-                response = await self.handle_message(
+                reply = await self.handle_message(
                     user_id=sender_id,
                     session_id=str(message.channel.id),
                     message=prompt_with_text_attachments,
@@ -754,22 +879,57 @@ class DiscordChannel(ChannelBase):
                 )
         except Exception:
             logger.exception("Agent run failed for Discord message %s", message.id)
-            await _send(
+            await _send_first(
                 "Sorry — something went wrong handling that message. "
                 "Check the bot logs."
             )
             return
 
-        if not response:
-            await _send("(no response)")
-            return
-
-        for chunk in _split_for_discord(response):
-            await _send(chunk)
+        await self._dispatch_reply(reply, _send_first, _send_follow)
 
     def run(self) -> None:
         """Block on the Discord client. Returns when the bot disconnects."""
         self._client.run(self._token)
+
+
+def _to_discord_files(
+    files: Sequence[OutboundFile],
+) -> tuple[list[discord.File], list[str]]:
+    """Build `discord.File` objects from `OutboundFile`s.
+
+    Filenames are sanitized at the send boundary (defense in depth —
+    `ChannelBase` also sanitizes artifact names). Files larger than
+    `DISCORD_OUTBOUND_FILE_MAX_BYTES` are dropped and a `(skipped …)`
+    note is returned for the agent's reply text.
+    """
+    import discord  # local import — discord.py is an optional extra
+
+    cap = _outbound_file_max_bytes()
+    out: list[discord.File] = []
+    skipped_notes: list[str] = []
+    for f in files:
+        name = _sanitize_filename(f.filename)
+        if len(f.data) > cap:
+            skipped_notes.append(f"(skipped {name}: too large)")
+            continue
+        out.append(discord.File(fp=io.BytesIO(f.data), filename=name))
+    return out, skipped_notes
+
+
+def _batched(
+    items: list[discord.File], n: int
+) -> Iterator[list[discord.File]]:
+    """Yield successive `n`-sized chunks from `items`. Empty input
+    yields nothing — the caller decides whether the empty case is
+    distinct from a single empty batch."""
+    for i in range(0, len(items), n):
+        yield items[i : i + n]
+
+
+def _filename_of(f: discord.File) -> str:
+    """`discord.File.filename` may be `None`; surface a printable
+    name so error notes don't say 'could not attach None'."""
+    return f.filename or "file"
 
 
 def _split_for_discord(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:

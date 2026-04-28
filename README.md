@@ -217,6 +217,18 @@ PNG/JPEG/WebP/HEIC/HEIF, WAV/MP3/AIFF/AAC/OGG/FLAC,
 MP4/MPEG/MOV/AVI/FLV/WebM/WMV/3GPP, and PDF. An attachment-only
 message (no text) still wakes the agent.
 
+**Outbound files.** The agent can also send files back. Two paths
+work out of the box: any `Part(inline_data=…)` the model emits in
+its final response is delivered, and any artifact a tool saves via
+`tool_context.save_artifact(filename, Part(...))` is loaded from
+the registered `BaseArtifactService` (in-memory by default) and
+attached to the reply. Discord's caps apply: ≤10 files per
+message and 25 MB per file (`DISCORD_OUTBOUND_FILE_MAX_BYTES`,
+default `25_000_000`). Larger files are skipped with a `(skipped
+…: too large)` note appended to the text; >10 files are batched
+across follow-up messages. No built-in tool produces files yet —
+this is plumbing for future tools.
+
 **Conversation context backfill in channels.** When the bot is
 mentioned in a guild channel, it backfills the recent message history
 so the agent can follow the conversation flow rather than seeing only
