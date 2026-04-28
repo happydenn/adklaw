@@ -18,7 +18,7 @@ import pytest
 from google.adk.events import Event
 from google.genai import types
 
-from app.channels.base import ChannelBase, Origin
+from app.channels.base import ChannelBase, ContextMessage, Origin
 
 
 def _final_text_event(text: str) -> Event:
@@ -95,6 +95,54 @@ async def test_handle_message_origin_appears_in_user_content() -> None:
     assert "[/origin]\n\n" in text
     assert text.endswith("hi there")
     assert "papi (id=111)" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_message_context_block_appended_after_origin() -> None:
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    origin = Origin(
+        transport="discord",
+        sender_id="111",
+        location_id="42",
+        sender_display="papi",
+        location_display="guild 'g' (id=7) / channel #general",
+    )
+    context = [
+        ContextMessage(
+            sender_id="222", sender_display="alice", text="lead-up one"
+        ),
+        ContextMessage(
+            sender_id="333", sender_display="bob", text="lead-up two"
+        ),
+    ]
+    await ch.handle_message(
+        user_id="111",
+        session_id="42",
+        message="any tips?",
+        origin=origin,
+        context=context,
+    )
+    text = runner.calls[0]["new_message"].parts[0].text
+    origin_idx = text.index("[origin]")
+    context_idx = text.index("[context]")
+    user_idx = text.index("any tips?")
+    assert origin_idx < context_idx < user_idx
+    assert "alice (id=222): lead-up one" in text
+    assert "bob (id=333): lead-up two" in text
+    assert "[/context]" in text
+
+
+@pytest.mark.asyncio
+async def test_handle_message_no_context_block_when_omitted() -> None:
+    runner = _RecordingRunner()
+    ch = _make_channel(runner)
+    await ch.handle_message(
+        user_id="u", session_id="s", message="hi"
+    )
+    text = runner.calls[0]["new_message"].parts[0].text
+    assert "[context]" not in text
+    assert text == "hi"
 
 
 @pytest.mark.asyncio

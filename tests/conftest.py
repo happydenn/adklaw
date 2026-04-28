@@ -35,7 +35,12 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def _clear_caches() -> None:
     """Reset any module-level `@functools.cache` state between tests so
     env-driven config is recomputed."""
-    from app.channels.discord import _allowed_user_ids, _allowlist_scope
+    from app.channels.discord import (
+        _allowed_user_ids,
+        _allowlist_scope,
+        _history_limit,
+    )
 
     _allowed_user_ids.cache_clear()
     _allowlist_scope.cache_clear()
+    _history_limit.cache_clear()

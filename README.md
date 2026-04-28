@@ -142,6 +142,18 @@ invited it to is implicitly trusted). To gate guild mentions too,
 set `DISCORD_ALLOWLIST_SCOPE=all`. Valid values are `dm` (default)
 and `all`.
 
+**Conversation context backfill in channels.** When the bot is
+mentioned in a guild channel, it backfills the recent message history
+so the agent can follow the conversation flow rather than seeing only
+the triggering message. Each channel keeps an in-memory rolling
+buffer; the first mention per channel since process start triggers a
+one-shot `channel.history()` fetch via the Discord API to seed the
+buffer, and every subsequent mention reads context straight from
+memory. Configure with `DISCORD_CONTEXT_HISTORY_LINES` (default `20`,
+set to `0` to disable). DMs are not backfilled — the ADK session
+already has full DM history. See [`docs/channels-context.md`](docs/channels-context.md)
+for the design rationale.
+
 ### Future channels
 
 Slack, Telegram, etc. follow the same shape as `discord.py`: subclass

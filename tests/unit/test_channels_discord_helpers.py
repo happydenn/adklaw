@@ -5,9 +5,11 @@ from __future__ import annotations
 import pytest
 
 from app.channels.discord import (
+    DEFAULT_HISTORY_LINES,
     DISCORD_MESSAGE_LIMIT,
     _allowed_user_ids,
     _allowlist_scope,
+    _history_limit,
     _split_for_discord,
 )
 
@@ -99,4 +101,42 @@ def test_allowlist_scope_unknown_falls_back(
     monkeypatch.setenv("DISCORD_ALLOWLIST_SCOPE", "wat")
     with caplog.at_level(logging.WARNING, logger="app.channels.discord"):
         assert _allowlist_scope() == "dm"
+    assert any("wat" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _history_limit
+# ---------------------------------------------------------------------------
+
+
+def test_history_limit_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DISCORD_CONTEXT_HISTORY_LINES", raising=False)
+    assert _history_limit() == DEFAULT_HISTORY_LINES == 20
+
+
+def test_history_limit_zero_disables(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_CONTEXT_HISTORY_LINES", "0")
+    assert _history_limit() == 0
+
+
+def test_history_limit_explicit_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_CONTEXT_HISTORY_LINES", "5")
+    assert _history_limit() == 5
+
+
+def test_history_limit_negative_clamps_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_CONTEXT_HISTORY_LINES", "-3")
+    assert _history_limit() == 0
+
+
+def test_history_limit_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    monkeypatch.setenv("DISCORD_CONTEXT_HISTORY_LINES", "wat")
+    with caplog.at_level(logging.WARNING, logger="app.channels.discord"):
+        assert _history_limit() == DEFAULT_HISTORY_LINES
     assert any("wat" in r.message for r in caplog.records)

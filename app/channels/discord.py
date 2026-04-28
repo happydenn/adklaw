@@ -13,6 +13,7 @@ Run with:
 
 from __future__ import annotations
 
+import collections
 import functools
 import logging
 import os
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING
 from google.adk.apps import App
 from google.adk.sessions import BaseSessionService
 
-from .base import ChannelBase, Origin
+from .base import ChannelBase, ContextMessage, Origin
 
 if TYPE_CHECKING:
     import discord
@@ -43,6 +44,31 @@ def _allowed_user_ids() -> frozenset[str]:
     if not raw:
         return frozenset()
     return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+DEFAULT_HISTORY_LINES = 20
+
+
+@functools.cache
+def _history_limit() -> int:
+    """How many prior channel messages to ship as `[context]` on a guild
+    mention. `0` disables the feature entirely (no buffer, no API calls).
+
+    Configured via `DISCORD_CONTEXT_HISTORY_LINES`; default 20.
+    """
+    raw = os.environ.get("DISCORD_CONTEXT_HISTORY_LINES", "").strip()
+    if not raw:
+        return DEFAULT_HISTORY_LINES
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid DISCORD_CONTEXT_HISTORY_LINES=%r; defaulting to %d.",
+            raw,
+            DEFAULT_HISTORY_LINES,
+        )
+        return DEFAULT_HISTORY_LINES
+    return max(0, n)
 
 
 @functools.cache
@@ -87,6 +113,13 @@ class DiscordChannel(ChannelBase):
         # Resets on restart by design — keeps the feature stateless on
         # disk; the cost is one repeat notice after a bot restart.
         self._notified_disallowed: set[str] = set()
+        # Per-channel rolling buffer of recent messages (for `[context]`
+        # backfill on guild mentions). Each deque is sized to
+        # `_history_limit()`. The seeded set tracks which channels have
+        # been backfilled via `channel.history()` since process start;
+        # only the FIRST mention in a channel triggers an API call.
+        self._channel_buffers: dict[int, collections.deque[ContextMessage]] = {}
+        self._seeded_channels: set[int] = set()
 
         @self._client.event
         async def on_ready() -> None:
@@ -96,7 +129,100 @@ class DiscordChannel(ChannelBase):
         async def on_message(message: discord.Message) -> None:
             await self._on_message(message)
 
+    def _record_in_buffer(self, message: discord.Message) -> None:
+        """Append a guild message to its channel's rolling context buffer.
+
+        Skips bot messages (including our own) and empty content. Creates
+        the deque lazily so we only allocate for channels we actually see.
+        """
+        limit = _history_limit()
+        if limit <= 0:
+            return
+        if message.guild is None:
+            return
+        if message.author.bot:
+            return
+        text = message.clean_content
+        if not text:
+            return
+        buf = self._channel_buffers.get(message.channel.id)
+        if buf is None:
+            buf = collections.deque(maxlen=limit)
+            self._channel_buffers[message.channel.id] = buf
+        buf.append(
+            ContextMessage(
+                sender_id=str(message.author.id),
+                sender_display=message.author.display_name,
+                text=text,
+            )
+        )
+
+    async def _build_context(
+        self, message: discord.Message
+    ) -> list[ContextMessage]:
+        """Return up to N prior messages from the channel for `[context]`.
+
+        First mention in a channel since startup → fetch via
+        `channel.history(limit=N, before=message)` and seed the buffer.
+        Subsequent mentions → read straight from the buffer (zero API
+        calls). On history fetch failure, return an empty list and do
+        NOT mark the channel seeded so the next mention will retry.
+        """
+        limit = _history_limit()
+        if limit <= 0:
+            return []
+        channel_id = message.channel.id
+        if channel_id in self._seeded_channels:
+            buf = self._channel_buffers.get(channel_id)
+            if buf is None:
+                return []
+            # The trigger message was appended at the top of _on_message,
+            # so it's the last entry. Drop it; the caller is the trigger.
+            buf_list = list(buf)
+            return buf_list[:-1] if buf_list else []
+
+        # First mention since startup — backfill via REST.
+        msgs: list[ContextMessage] = []
+        try:
+            async for hist in message.channel.history(
+                limit=limit, before=message
+            ):
+                if hist.author.bot:
+                    continue
+                text = hist.clean_content
+                if not text:
+                    continue
+                msgs.append(
+                    ContextMessage(
+                        sender_id=str(hist.author.id),
+                        sender_display=hist.author.display_name,
+                        text=text,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "Failed to fetch channel history for %s; "
+                "proceeding without [context] block",
+                channel_id,
+            )
+            return []
+        # discord.py yields newest-first; reverse to oldest-first.
+        msgs.reverse()
+        # Seed the buffer with what we got so subsequent mentions can
+        # serve from memory.
+        buf: collections.deque[ContextMessage] = collections.deque(
+            msgs, maxlen=limit
+        )
+        self._channel_buffers[channel_id] = buf
+        self._seeded_channels.add(channel_id)
+        return msgs
+
     async def _on_message(self, message: discord.Message) -> None:
+        # Record every guild message into the channel's rolling buffer
+        # before any gating — even messages that don't trigger the bot
+        # are valuable conversational context for the next mention.
+        self._record_in_buffer(message)
+
         # Ignore our own messages and other bots.
         if message.author.bot:
             return
@@ -168,6 +294,13 @@ class DiscordChannel(ChannelBase):
             location_display=location_display,
         )
 
+        # Backfill prior chatter only for guild mentions. DMs already
+        # round-trip every message through the agent, so the session
+        # has full DM history without any extra fetching.
+        context: list[ContextMessage] = []
+        if not is_dm:
+            context = await self._build_context(message)
+
         try:
             async with message.channel.typing():
                 response = await self.handle_message(
@@ -175,6 +308,7 @@ class DiscordChannel(ChannelBase):
                     session_id=str(message.channel.id),
                     message=prompt,
                     origin=origin,
+                    context=context or None,
                 )
         except Exception:
             logger.exception("Agent run failed for Discord message %s", message.id)

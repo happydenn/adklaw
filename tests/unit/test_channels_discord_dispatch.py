@@ -48,6 +48,9 @@ class _FakeGuild:
 class _FakeChannel:
     id: int
     name: str = "general"
+    history_messages: list[Any] = field(default_factory=list)
+    history_calls: list[dict[str, Any]] = field(default_factory=list)
+    history_raises: BaseException | None = None
 
     def typing(self) -> Any:
         @asynccontextmanager
@@ -55,6 +58,21 @@ class _FakeChannel:
             yield
 
         return _cm()
+
+    def history(self, *, limit: int, before: Any) -> Any:
+        """Mimic `discord.TextChannel.history` — returns an async iterator
+        that yields newest-first (matching discord.py semantics)."""
+        self.history_calls.append({"limit": limit, "before": before})
+        raises = self.history_raises
+        msgs = list(self.history_messages)
+
+        async def _gen():
+            if raises is not None:
+                raise raises
+            for m in msgs:
+                yield m
+
+        return _gen()
 
 
 @dataclass
@@ -350,3 +368,283 @@ async def test_agent_failure_replies_apology(
     await channel._on_message(msg)  # type: ignore[arg-type]
     assert len(msg.replies) == 1
     assert "wrong" in msg.replies[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Context backfill: rolling buffer + seed-once-per-channel via channel.history()
+# ---------------------------------------------------------------------------
+
+
+def _hist_msg(
+    msg_id: int,
+    sender_id: int,
+    sender_name: str,
+    content: str,
+    *,
+    bot: bool = False,
+) -> _FakeMessage:
+    """Build a `_FakeMessage` shaped like a discord.py history entry."""
+    return _FakeMessage(
+        id=msg_id,
+        author=_FakeAuthor(id=sender_id, display_name=sender_name, bot=bot),
+        channel=_FakeChannel(id=42),
+        clean_content=content,
+        guild=_FakeGuild(id=7, name="my-guild"),
+    )
+
+
+def _make_guild_message(
+    *,
+    msg_id: int,
+    sender_id: int,
+    content: str,
+    fake_channel: _FakeChannel,
+    sender_name: str = "papi",
+    bot: bool = False,
+    mention_bot: DiscordChannel | None = None,
+) -> _FakeMessage:
+    """Like `_make_message(is_dm=False)` but reuses a passed-in fake channel
+    so we can attach a shared `history_messages` / `history_calls`."""
+    author = _FakeAuthor(id=sender_id, display_name=sender_name, bot=bot)
+    mentions: list[Any] = []
+    if mention_bot is not None:
+        mentions.append(_bot_user_for(mention_bot))
+    return _FakeMessage(
+        id=msg_id,
+        author=author,
+        channel=fake_channel,
+        clean_content=content,
+        guild=_FakeGuild(id=7, name="my-guild"),
+        mentions=mentions,
+    )
+
+
+@pytest.mark.asyncio
+async def test_buffer_records_every_non_bot_guild_message(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even messages that don't trigger the bot get appended to the
+    channel's rolling buffer so they're available for the next mention."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    msg = _make_guild_message(
+        msg_id=1, sender_id=10, content="just chatting", fake_channel=fc
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_not_called()  # type: ignore[attr-defined]
+    buf = channel._channel_buffers.get(42)
+    assert buf is not None
+    assert len(buf) == 1
+    assert buf[0].sender_id == "10"
+    assert buf[0].text == "just chatting"
+
+
+@pytest.mark.asyncio
+async def test_first_mention_seeds_via_history_api(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First mention in a channel triggers `channel.history(limit=N, before=msg)`,
+    replaces the buffer with the API result, and marks the channel seeded."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    # discord.py yields newest-first; the channel should reverse to oldest-first.
+    fc.history_messages = [
+        _hist_msg(202, 333, "bob", "yeah what's up"),
+        _hist_msg(201, 222, "alice", "hey is anyone here good with python?"),
+    ]
+    trigger = _make_guild_message(
+        msg_id=300,
+        sender_id=111,
+        content="hello",
+        fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    assert len(fc.history_calls) == 1
+    assert fc.history_calls[0]["limit"] == 20
+    assert fc.history_calls[0]["before"] is trigger
+    assert 42 in channel._seeded_channels
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    ctx = kwargs["context"]
+    assert ctx is not None
+    assert [m.text for m in ctx] == [
+        "hey is anyone here good with python?",
+        "yeah what's up",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_subsequent_mention_uses_buffer_no_api(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a channel is seeded, mentions read context from the buffer
+    with zero `history()` calls."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    # Pre-seed manually to simulate "we've already done the API once".
+    channel._seeded_channels.add(42)
+    import collections
+
+    channel._channel_buffers[42] = collections.deque(maxlen=20)
+
+    chatter1 = _make_guild_message(
+        msg_id=1, sender_id=222, content="msg one", fake_channel=fc,
+        sender_name="alice",
+    )
+    chatter2 = _make_guild_message(
+        msg_id=2, sender_id=333, content="msg two", fake_channel=fc,
+        sender_name="bob",
+    )
+    await channel._on_message(chatter1)  # type: ignore[arg-type]
+    await channel._on_message(chatter2)  # type: ignore[arg-type]
+    trigger = _make_guild_message(
+        msg_id=3, sender_id=111, content="follow up", fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+
+    assert fc.history_calls == []  # buffer warm — no API call
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    ctx = kwargs["context"]
+    assert [m.text for m in ctx] == ["msg one", "msg two"]
+
+
+@pytest.mark.asyncio
+async def test_quiet_channel_with_few_messages_seeds_with_what_exists(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a channel that has only 3 lifetime messages must
+    seed with 3 and serve from the buffer thereafter — never hit the
+    API on every subsequent mention just because the buffer has < N."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    fc.history_messages = [
+        _hist_msg(102, 222, "alice", "two"),
+        _hist_msg(101, 222, "alice", "one"),
+    ]  # only 2 in the channel's lifetime, much less than N=20
+    trigger1 = _make_guild_message(
+        msg_id=200, sender_id=111, content="hi", fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(trigger1)  # type: ignore[arg-type]
+    assert len(fc.history_calls) == 1
+    trigger2 = _make_guild_message(
+        msg_id=201, sender_id=111, content="hi again", fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(trigger2)  # type: ignore[arg-type]
+    # No second API call — the channel is already seeded.
+    assert len(fc.history_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_fetch_failure_falls_through_silently(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If `history()` raises, the agent still gets the mention — just
+    without a `[context]` block. The channel must NOT be marked seeded
+    so the next mention can retry."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    fc.history_raises = RuntimeError("rate limited")
+    trigger = _make_guild_message(
+        msg_id=1, sender_id=111, content="hi", fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["context"] is None
+    assert 42 not in channel._seeded_channels
+
+
+@pytest.mark.asyncio
+async def test_dm_never_fetches_history_or_uses_buffer(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DMs already round-trip every message; no `[context]` block needed."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    msg = _make_message(sender_id=1, content="hi", is_dm=True)
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["context"] is None
+    assert msg.channel.history_calls == []
+    # DM channel id never gets a buffer.
+    assert msg.channel.id not in channel._channel_buffers
+
+
+@pytest.mark.asyncio
+async def test_history_lines_zero_disables_buffer_and_api(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_CONTEXT_HISTORY_LINES", "0")
+    from app.channels.discord import _history_limit
+
+    _history_limit.cache_clear()
+
+    fc = _FakeChannel(id=42)
+    fc.history_messages = [_hist_msg(101, 222, "alice", "one")]
+    chatter = _make_guild_message(
+        msg_id=1, sender_id=222, content="lurk", fake_channel=fc,
+        sender_name="alice",
+    )
+    trigger = _make_guild_message(
+        msg_id=2, sender_id=111, content="hi", fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(chatter)  # type: ignore[arg-type]
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    assert fc.history_calls == []
+    assert 42 not in channel._channel_buffers
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    assert kwargs["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_buffer_excludes_bot_messages(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    bot_msg = _make_guild_message(
+        msg_id=1, sender_id=999, content="bot says hi", fake_channel=fc,
+        sender_name="OtherBot", bot=True,
+    )
+    user_msg = _make_guild_message(
+        msg_id=2, sender_id=222, content="real user", fake_channel=fc,
+        sender_name="alice",
+    )
+    await channel._on_message(bot_msg)  # type: ignore[arg-type]
+    await channel._on_message(user_msg)  # type: ignore[arg-type]
+    buf = channel._channel_buffers[42]
+    assert [m.text for m in buf] == ["real user"]
+
+
+@pytest.mark.asyncio
+async def test_seeded_buffer_excludes_trigger_message(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trigger gets recorded into the buffer at the top of
+    `_on_message`; when we build context for it, we must drop the most
+    recent entry so the agent doesn't see its own prompt twice."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    fc = _FakeChannel(id=42)
+    channel._seeded_channels.add(42)
+    import collections
+
+    channel._channel_buffers[42] = collections.deque(maxlen=20)
+    chatter = _make_guild_message(
+        msg_id=1, sender_id=222, content="lead-up", fake_channel=fc,
+        sender_name="alice",
+    )
+    await channel._on_message(chatter)  # type: ignore[arg-type]
+    trigger = _make_guild_message(
+        msg_id=2, sender_id=111, content="hello bot", fake_channel=fc,
+        mention_bot=channel,
+    )
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    ctx = kwargs["context"]
+    assert [m.text for m in ctx] == ["lead-up"]
+    assert kwargs["message"] == "hello bot"

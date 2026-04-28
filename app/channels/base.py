@@ -44,6 +44,22 @@ class Origin:
     location_display: str | None = None
 
 
+@dataclass(frozen=True)
+class ContextMessage:
+    """One prior message in a channel, used to backfill conversational context.
+
+    Channels collect these from their transport — Discord pulls them
+    from `channel.history()` or its in-memory buffer; future Slack /
+    Telegram channels would do the analogous thing — and pass them
+    through to the agent so the bot can reason about lead-up chatter
+    it didn't directly receive.
+    """
+
+    sender_id: str
+    text: str
+    sender_display: str | None = None
+
+
 def _id_label(display: str | None, id_: str) -> str:
     return f"{display} (id={id_})" if display else f"id={id_}"
 
@@ -56,6 +72,16 @@ def _format_origin(o: Origin) -> str:
         f"location: {_id_label(o.location_display, o.location_id)}\n"
         "[/origin]\n\n"
     )
+
+
+def _format_context(messages: list[ContextMessage]) -> str:
+    if not messages:
+        return ""
+    lines = ["[context] (recent messages, oldest first)"]
+    for m in messages:
+        lines.append(f"{_id_label(m.sender_display, m.sender_id)}: {m.text}")
+    lines.append("[/context]\n")
+    return "\n".join(lines) + "\n"
 
 
 class ChannelBase:
@@ -106,6 +132,7 @@ class ChannelBase:
         session_id: str,
         message: str,
         origin: Origin | None = None,
+        context: list[ContextMessage] | None = None,
     ) -> str:
         """Run one turn of the agent and return its assistant text.
 
@@ -121,13 +148,21 @@ class ChannelBase:
                 prelude is prepended to the user content so the agent
                 can identify the sender and location. Channels build
                 this; CLI / tests can omit it.
+            context: Optional list of prior messages from the same
+                location, oldest-first, used to backfill conversational
+                context the agent didn't directly receive. Rendered as
+                a `[context]…[/context]` block between the origin and
+                the user message.
 
         Returns:
             The agent's final assistant text. Tool calls and partial
             streaming events are collected internally and excluded from
             the returned string.
         """
-        text = _format_origin(origin) + message if origin else message
+        prefix = (_format_origin(origin) if origin else "") + (
+            _format_context(context) if context else ""
+        )
+        text = prefix + message
         new_message = types.Content(role="user", parts=[types.Part(text=text)])
         chunks: list[str] = []
         async with self._lock_for(session_id):
