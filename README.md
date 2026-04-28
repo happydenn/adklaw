@@ -96,8 +96,12 @@ Run as its own process:
 
 ```bash
 uv sync --extra discord
-DISCORD_BOT_TOKEN=<your token> uv run python -m app.channels.discord
+uv run python -m app.channels.discord
 ```
+
+The bot reads `DISCORD_BOT_TOKEN` (and the GCP env vars) from `.env`
+automatically — no shell sourcing required. Channels auto-load `.env`
+the same way `agents-cli` does.
 
 Setup:
 
