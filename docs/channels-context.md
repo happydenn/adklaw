@@ -83,11 +83,15 @@ discord.py's built-in event replay. The buffer keeps converging.
 
 ## What goes in the buffer
 
-- Every non-bot guild message with non-empty `clean_content`.
-- Bot messages (including the bot's own replies and webhooks/bridges
-  written by other bots) are excluded — the bot's own replies are
-  already in the ADK session, and including arbitrary other bots
-  would muddy the conversation more than it helps.
+- Every guild message with non-empty `clean_content`, **except** the
+  bot's own replies (`message.author.id == client.user.id`). Our own
+  replies are already in the ADK session, so including them in
+  `[context]` would just duplicate what the agent already sees.
+- Other bots, webhooks, and bridge accounts (PluralKit, IRC relays,
+  GitHub/news integrations, etc.) **are kept**. They're real
+  conversational content and dropping them would strip out major
+  threads of activity in many channels — especially ones where the
+  "users" are bridged from another platform.
 
 The trigger message itself is appended at the top of `_on_message`
 along with every other message. When we build context for it, we

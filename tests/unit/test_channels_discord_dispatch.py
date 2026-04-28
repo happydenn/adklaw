@@ -602,23 +602,56 @@ async def test_history_lines_zero_disables_buffer_and_api(
 
 
 @pytest.mark.asyncio
-async def test_buffer_excludes_bot_messages(
+async def test_buffer_excludes_only_self_keeps_other_bots(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Webhooks, bridge bots (PluralKit, IRC relays), and integration
+    bots (GitHub, news) are real conversational content. Only our own
+    bot's messages get filtered (they're already in the ADK session)."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    self_id = _bot_user_for(channel).id
+    fc = _FakeChannel(id=42)
+    own_msg = _make_guild_message(
+        msg_id=1, sender_id=self_id, content="my own reply",
+        fake_channel=fc, sender_name="TestBot", bot=True,
+    )
+    other_bot = _make_guild_message(
+        msg_id=2, sender_id=555, content="webhook announcement",
+        fake_channel=fc, sender_name="GitHubBot", bot=True,
+    )
+    user_msg = _make_guild_message(
+        msg_id=3, sender_id=222, content="real user",
+        fake_channel=fc, sender_name="alice",
+    )
+    await channel._on_message(own_msg)  # type: ignore[arg-type]
+    await channel._on_message(other_bot)  # type: ignore[arg-type]
+    await channel._on_message(user_msg)  # type: ignore[arg-type]
+    buf = channel._channel_buffers[42]
+    assert [m.text for m in buf] == ["webhook announcement", "real user"]
+
+
+@pytest.mark.asyncio
+async def test_history_seed_excludes_only_self_keeps_other_bots(
     channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    self_id = _bot_user_for(channel).id
     fc = _FakeChannel(id=42)
-    bot_msg = _make_guild_message(
-        msg_id=1, sender_id=999, content="bot says hi", fake_channel=fc,
-        sender_name="OtherBot", bot=True,
+    fc.history_messages = [
+        # discord.py yields newest-first
+        _hist_msg(303, 222, "alice", "user message"),
+        _hist_msg(302, 555, "GitHubBot", "PR opened", bot=True),
+        _hist_msg(301, self_id, "TestBot", "my own old reply", bot=True),
+    ]
+    trigger = _make_guild_message(
+        msg_id=400, sender_id=111, content="status?",
+        fake_channel=fc, mention_bot=channel,
     )
-    user_msg = _make_guild_message(
-        msg_id=2, sender_id=222, content="real user", fake_channel=fc,
-        sender_name="alice",
-    )
-    await channel._on_message(bot_msg)  # type: ignore[arg-type]
-    await channel._on_message(user_msg)  # type: ignore[arg-type]
-    buf = channel._channel_buffers[42]
-    assert [m.text for m in buf] == ["real user"]
+    await channel._on_message(trigger)  # type: ignore[arg-type]
+    kwargs = channel.handle_message.call_args.kwargs  # type: ignore[attr-defined]
+    ctx = kwargs["context"]
+    # Self-bot filtered, other-bot kept, real user kept; oldest-first.
+    assert [m.text for m in ctx] == ["PR opened", "user message"]
 
 
 @pytest.mark.asyncio

@@ -132,15 +132,19 @@ class DiscordChannel(ChannelBase):
     def _record_in_buffer(self, message: discord.Message) -> None:
         """Append a guild message to its channel's rolling context buffer.
 
-        Skips bot messages (including our own) and empty content. Creates
-        the deque lazily so we only allocate for channels we actually see.
+        Skips our own bot's messages (already in the ADK session) and
+        empty content, but **keeps** messages from other bots — webhooks,
+        bridges (PluralKit, IRC relays), GitHub/news integrations, etc.
+        are conversational content the agent should see for continuity.
+        Creates the deque lazily so we only allocate for channels we
+        actually see.
         """
         limit = _history_limit()
         if limit <= 0:
             return
         if message.guild is None:
             return
-        if message.author.bot:
+        if self._client.user is not None and message.author.id == self._client.user.id:
             return
         text = message.clean_content
         if not text:
@@ -183,11 +187,17 @@ class DiscordChannel(ChannelBase):
 
         # First mention since startup — backfill via REST.
         msgs: list[ContextMessage] = []
+        bot_user_id = (
+            self._client.user.id if self._client.user is not None else None
+        )
         try:
             async for hist in message.channel.history(
                 limit=limit, before=message
             ):
-                if hist.author.bot:
+                # Skip only our own messages (already in the session).
+                # Other bots / webhooks / bridges are real conversational
+                # content and stay in.
+                if bot_user_id is not None and hist.author.id == bot_user_id:
                     continue
                 text = hist.clean_content
                 if not text:
