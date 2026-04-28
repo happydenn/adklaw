@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -13,6 +14,8 @@ import pytest
 
 from app import tools
 from app.tools import (
+    EDIT_DIFF_MAX_BYTES,
+    EDIT_SNAPSHOTS_PER_FILE,
     MAX_FETCH_BYTES,
     MAX_GREP_RESULTS,
     edit_file,
@@ -21,6 +24,7 @@ from app.tools import (
     list_dir,
     read_file,
     run_shell,
+    undo_last_edit,
     web_fetch,
     web_search,
     write_file,
@@ -95,29 +99,296 @@ def test_write_file_outside_workspace(workspace_dir: Path) -> None:
 
 
 def test_edit_file_unique_match(workspace_dir: Path) -> None:
-    (workspace_dir / "f.txt").write_text("alpha beta gamma", encoding="utf-8")
-    result = edit_file("f.txt", "beta", "BETA")
+    (workspace_dir / "f.txt").write_text(
+        "first line\nalpha beta gamma\nthird line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file(
+        "f.txt", "alpha beta gamma\nthird line", "alpha BETA gamma\nthird line"
+    )
     assert result["status"] == "success"
-    assert (workspace_dir / "f.txt").read_text(encoding="utf-8") == "alpha BETA gamma"
+    assert (workspace_dir / "f.txt").read_text(encoding="utf-8") == (
+        "first line\nalpha BETA gamma\nthird line\n"
+    )
 
 
 def test_edit_file_no_match(workspace_dir: Path) -> None:
-    (workspace_dir / "f.txt").write_text("hello", encoding="utf-8")
-    result = edit_file("f.txt", "missing", "x")
+    (workspace_dir / "f.txt").write_text(
+        "hello world\nsecond line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file(
+        "f.txt", "missing\nstring", "replacement\nstring"
+    )
     assert result["status"] == "error"
     assert "not found" in result["error"]
 
 
 def test_edit_file_multiple_matches(workspace_dir: Path) -> None:
-    (workspace_dir / "f.txt").write_text("dup dup", encoding="utf-8")
-    result = edit_file("f.txt", "dup", "x")
+    (workspace_dir / "f.txt").write_text(
+        "dup line\nfiller\ndup line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file("f.txt", "dup line\n", "x line\n")
     assert result["status"] == "error"
     assert "not unique" in result["error"]
 
 
 def test_edit_file_missing_file(workspace_dir: Path) -> None:
-    result = edit_file("nope.txt", "a", "b")
+    result = edit_file(
+        "nope.txt", "first line\nsecond line", "first line\nSECOND line"
+    )
     assert result["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# edit_file: read-before-edit invariant
+# ---------------------------------------------------------------------------
+
+
+def test_edit_requires_prior_read(workspace_dir: Path) -> None:
+    (workspace_dir / "f.txt").write_text(
+        "first line\nsecond line\n", encoding="utf-8"
+    )
+    # No read_file call — cache miss.
+    result = edit_file(
+        "f.txt", "first line\nsecond line", "first line\nSECOND line"
+    )
+    assert result["status"] == "error"
+    assert "read the file first" in result["error"]
+
+
+def test_edit_after_read_succeeds(workspace_dir: Path, state_dir: Path) -> None:
+    (workspace_dir / "f.txt").write_text(
+        "first line\nsecond line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file(
+        "f.txt", "first line\nsecond line", "first line\nSECOND line"
+    )
+    assert result["status"] == "success"
+
+
+def test_edit_after_external_change_errors(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    target = workspace_dir / "f.txt"
+    target.write_text("first line\nsecond line\n", encoding="utf-8")
+    read_file("f.txt")
+    # Mimic an external write (e.g. user edited the file in their editor).
+    target.write_text("first line\nNEW line\n", encoding="utf-8")
+    result = edit_file(
+        "f.txt", "first line\nNEW line", "first line\nNEWER line"
+    )
+    assert result["status"] == "error"
+    assert "changed since last read" in result["error"]
+
+
+def test_successful_edit_updates_read_cache(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    """One read should be enough for a sequence of successful edits;
+    the cache is refreshed on each successful edit."""
+    (workspace_dir / "f.txt").write_text(
+        "alpha line\nbeta line\ngamma line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    r1 = edit_file("f.txt", "alpha line\nbeta", "ALPHA line\nbeta")
+    assert r1["status"] == "success"
+    r2 = edit_file("f.txt", "ALPHA line\nbeta", "ALPHA line\nBETA")
+    assert r2["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# edit_file: anchor minimum
+# ---------------------------------------------------------------------------
+
+
+def test_short_unanchored_old_string_rejected(workspace_dir: Path) -> None:
+    (workspace_dir / "f.txt").write_text("alpha beta gamma\n", encoding="utf-8")
+    read_file("f.txt")
+    result = edit_file("f.txt", "beta", "BETA")
+    assert result["status"] == "error"
+    assert "anchor" in result["error"]
+
+
+def test_short_old_string_with_newline_allowed(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    (workspace_dir / "f.txt").write_text("a\nb\nc\n", encoding="utf-8")
+    read_file("f.txt")
+    # Short but multi-line — newline counts as anchor.
+    result = edit_file("f.txt", "a\nb", "a\nB")
+    assert result["status"] == "success"
+
+
+# ---------------------------------------------------------------------------
+# edit_file: net-deletion guard
+# ---------------------------------------------------------------------------
+
+
+def test_large_byte_deletion_rejected_without_flag(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    """Edit removing > 30% of file bytes is refused without the flag."""
+    body = "header\n" + ("x" * 1000) + "\nfooter\n"
+    (workspace_dir / "f.txt").write_text(body, encoding="utf-8")
+    read_file("f.txt")
+    result = edit_file(
+        "f.txt", "header\n" + ("x" * 1000) + "\nfooter", "header\nfooter"
+    )
+    assert result["status"] == "error"
+    assert "remove" in result["error"]
+    assert "allow_large_deletion" in result["error"]
+
+
+def test_large_line_deletion_rejected_without_flag(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    """Edit removing >= 40 lines is refused without the flag."""
+    lines = "\n".join(f"line {i}" for i in range(60)) + "\n"
+    (workspace_dir / "f.txt").write_text(lines, encoding="utf-8")
+    read_file("f.txt")
+    block = "\n".join(f"line {i}" for i in range(5, 55))
+    result = edit_file("f.txt", block, "line 5")
+    assert result["status"] == "error"
+    assert "lines" in result["error"]
+
+
+def test_large_deletion_allowed_with_flag(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    body = "header\n" + ("x" * 1000) + "\nfooter\n"
+    (workspace_dir / "f.txt").write_text(body, encoding="utf-8")
+    read_file("f.txt")
+    result = edit_file(
+        "f.txt",
+        "header\n" + ("x" * 1000) + "\nfooter",
+        "header\nfooter",
+        allow_large_deletion=True,
+    )
+    assert result["status"] == "success"
+    assert "diff" in result
+
+
+# ---------------------------------------------------------------------------
+# edit_file: unified diff in response
+# ---------------------------------------------------------------------------
+
+
+def test_edit_returns_unified_diff(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    (workspace_dir / "f.txt").write_text(
+        "alpha line\nbeta line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file("f.txt", "alpha line\nbeta", "alpha line\nBETA")
+    assert result["status"] == "success"
+    diff = result["diff"]
+    assert "--- a/f.txt" in diff
+    assert "+++ b/f.txt" in diff
+    assert "+alpha line" not in diff  # context line, not added
+    assert "+alpha line\n+BETA" in diff or "+BETA" in diff
+
+
+def test_diff_truncated_when_huge(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    """A diff bigger than EDIT_DIFF_MAX_BYTES is truncated with a marker."""
+    # File of distinct lines so the diff includes them all.
+    body = "".join(f"old-line-{i:04d}\n" for i in range(2000))
+    (workspace_dir / "f.txt").write_text(body, encoding="utf-8")
+    read_file("f.txt")
+    new_body = "".join(f"new-line-{i:04d}\n" for i in range(2000))
+    result = edit_file(
+        "f.txt", body, new_body, allow_large_deletion=True
+    )
+    assert result["status"] == "success"
+    diff = result["diff"]
+    assert "(diff truncated)" in diff
+    assert len(diff.encode("utf-8")) <= EDIT_DIFF_MAX_BYTES + 64
+
+
+# ---------------------------------------------------------------------------
+# edit_file: snapshot + undo_last_edit
+# ---------------------------------------------------------------------------
+
+
+def test_edit_writes_snapshot_under_state_dir(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    (workspace_dir / "f.txt").write_text(
+        "alpha line\nbeta line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file("f.txt", "alpha line\nbeta", "alpha line\nBETA")
+    assert result["status"] == "success"
+    snap_path = Path(result["snapshot"])
+    assert snap_path.exists()
+    assert snap_path.is_relative_to(state_dir)
+    assert snap_path.read_text(encoding="utf-8") == "alpha line\nbeta line\n"
+
+
+def test_undo_restores_previous_content(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    target = workspace_dir / "f.txt"
+    target.write_text("alpha line\nbeta line\n", encoding="utf-8")
+    read_file("f.txt")
+    edit_result = edit_file("f.txt", "alpha line\nbeta", "alpha line\nBETA")
+    assert edit_result["status"] == "success"
+    snap_path = Path(edit_result["snapshot"])
+
+    undo_result = undo_last_edit("f.txt")
+    assert undo_result["status"] == "success"
+    assert target.read_text(encoding="utf-8") == "alpha line\nbeta line\n"
+    assert not snap_path.exists()
+
+
+def test_undo_with_no_snapshots_errors(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    (workspace_dir / "f.txt").write_text("hi\n", encoding="utf-8")
+    result = undo_last_edit("f.txt")
+    assert result["status"] == "error"
+    assert "No snapshot" in result["error"]
+
+
+def test_snapshot_retention_caps_per_file(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    """After more edits than the retention cap, only the newest cap-many
+    snapshot files for that path remain."""
+    target = workspace_dir / "f.txt"
+    target.write_text("v0 line\nbody\n", encoding="utf-8")
+    read_file("f.txt")
+    n = EDIT_SNAPSHOTS_PER_FILE + 5
+    for i in range(n):
+        prev = f"v{i} line"
+        new = f"v{i + 1} line"
+        # Sleep 1ms between edits so timestamps differ.
+        time.sleep(0.002)
+        result = edit_file("f.txt", f"{prev}\nbody", f"{new}\nbody")
+        assert result["status"] == "success", result
+    from app.tools import _path_hash, _snapshot_dir
+
+    sha_prefix = _path_hash(target.resolve())
+    snaps = list(_snapshot_dir().glob(f"{sha_prefix}-*"))
+    assert len(snaps) == EDIT_SNAPSHOTS_PER_FILE
+
+
+def test_atomic_write_does_not_leave_tempfile(
+    workspace_dir: Path, state_dir: Path
+) -> None:
+    (workspace_dir / "f.txt").write_text(
+        "alpha line\nbeta line\n", encoding="utf-8"
+    )
+    read_file("f.txt")
+    result = edit_file("f.txt", "alpha line\nbeta", "alpha line\nBETA")
+    assert result["status"] == "success"
+    leftover = list(workspace_dir.glob(".adklaw-*"))
+    assert leftover == []
 
 
 # ---------------------------------------------------------------------------

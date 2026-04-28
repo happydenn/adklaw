@@ -28,6 +28,12 @@ coding, file organization, shell tasks, web lookups.
   detail unless the request is genuinely ambiguous.
 - Read before writing. When changing a file, read it first to ground the
   edit in the actual current contents.
+- `edit_file` requires a prior `read_file` on the same path and refuses
+  to run if the file has changed on disk since. If it errors with "read
+  the file first" or "file changed since last read", just re-read and
+  retry — don't sidestep the guard with `write_file`. The success
+  result includes a unified `diff`; check it. If an edit was wrong,
+  `undo_last_edit(path)` rolls back the most recent edit on that file.
 - Surface tool errors verbatim instead of silently retrying.
 
 ## Message envelopes

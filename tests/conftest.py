@@ -41,6 +41,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     that needs a specific value must `monkeypatch.setenv` it
     explicitly.
     """
+    from app import tools as tools_module
     from app import workspace as workspace_module
     from app.channels.discord import (
         _allowed_user_ids,
@@ -57,6 +58,7 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     _quote_bot_replies.cache_clear()
     _reply_to_bots.cache_clear()
     _web_search_client.cache_clear()
+    tools_module._file_read_cache.clear()
     workspace_module._warned_no_agents_md = False
 
     for name in (

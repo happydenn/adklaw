@@ -8,17 +8,23 @@ failure without raising exceptions.
 
 from __future__ import annotations
 
+import difflib
 import functools
+import hashlib
 import logging
 import os
 import re
 import subprocess
+import tempfile
+import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from google import genai
 from google.genai import types
 
+from .state import get_state_dir
 from .workspace import get_workspace, resolve_in_workspace
 
 logger = logging.getLogger(__name__)
@@ -31,6 +37,18 @@ SHELL_TIMEOUT_SECONDS = 60
 WEB_SEARCH_MODEL_DEFAULT = "gemini-2.5-flash-lite"
 WEB_SEARCH_LATLNG_DEFAULT = "25.0330,121.5654"  # Taipei
 
+# `edit_file` safety knobs.
+EDIT_DELETE_RATIO_THRESHOLD = 0.30
+EDIT_DELETE_LINES_THRESHOLD = 40
+EDIT_ANCHOR_MIN_LEN = 20
+EDIT_DIFF_MAX_BYTES = 8192
+EDIT_SNAPSHOTS_PER_FILE = 20
+
+# Per-process map: resolved absolute path → SHA-256 of contents at last
+# `read_file`. `edit_file` requires a recent matching read so a stale
+# `old_string` can't clobber concurrent on-disk changes.
+_file_read_cache: dict[str, str] = {}
+
 
 def _ok(**fields) -> dict:
     return {"status": "success", **fields}
@@ -40,8 +58,79 @@ def _err(message: str) -> dict:
     return {"status": "error", "error": message}
 
 
+def _compute_sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _path_hash(target: Path) -> str:
+    """Stable short hash of an absolute path, used to namespace
+    snapshot files per logical file."""
+    return hashlib.sha1(str(target).encode("utf-8")).hexdigest()[:12]
+
+
+def _make_diff(before: str, after: str, path: str) -> str:
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            n=3,
+        )
+    )
+    if len(diff.encode("utf-8")) > EDIT_DIFF_MAX_BYTES:
+        return diff[:EDIT_DIFF_MAX_BYTES] + "\n... (diff truncated)\n"
+    return diff
+
+
+def _snapshot_dir() -> Path:
+    d = get_state_dir() / "edits"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _save_snapshot(target: Path, content: bytes) -> Path:
+    """Copy pre-edit bytes into the snapshot dir under a per-path
+    prefix, then evict oldest snapshots so each file keeps at most
+    `EDIT_SNAPSHOTS_PER_FILE` versions."""
+    sha_prefix = _path_hash(target)
+    snap = _snapshot_dir() / f"{sha_prefix}-{target.name}.{int(time.time() * 1000)}"
+    snap.write_bytes(content)
+    siblings = sorted(
+        _snapshot_dir().glob(f"{sha_prefix}-*"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for old in siblings[:-EDIT_SNAPSHOTS_PER_FILE]:
+        old.unlink(missing_ok=True)
+    return snap
+
+
+def _atomic_write(target: Path, text: str) -> None:
+    """Write `text` to `target` via a sibling tempfile + `os.replace`.
+
+    Crash-safe: a partial write can never leave the target half-
+    written, since the rename is atomic on POSIX and Windows.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".adklaw-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def read_file(path: str) -> dict:
     """Read a text file from the workspace.
+
+    Also records the file's SHA-256 in the per-process read cache so
+    `edit_file` can verify the content hasn't changed since the agent
+    last saw it. Without this guard a stale `old_string` could clobber
+    concurrent on-disk changes.
 
     Args:
         path: File path, relative to the workspace or an absolute path inside
@@ -72,6 +161,7 @@ def read_file(path: str) -> dict:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
         return _err("File is not valid UTF-8 text.")
+    _file_read_cache[str(target)] = _compute_sha(data)
     return _ok(path=str(target), content=content)
 
 
@@ -98,17 +188,45 @@ def write_file(path: str, content: str) -> dict:
     return _ok(path=str(target), bytes_written=len(content.encode("utf-8")))
 
 
-def edit_file(path: str, old_string: str, new_string: str) -> dict:
+def edit_file(
+    path: str,
+    old_string: str,
+    new_string: str,
+    allow_large_deletion: bool = False,
+) -> dict:
     """Replace exactly one occurrence of `old_string` with `new_string`.
+
+    Layered safety checks (each catches a different failure mode seen
+    in real use):
+
+    1. **Anchor minimum** — `old_string` must be at least 20 chars or
+       contain a newline, so a vague short match can't pick the wrong
+       location.
+    2. **Read-before-edit** — the file must have been read via
+       `read_file` and not changed on disk since. Errors with a
+       concrete next action ("read first" / "re-read") instead of
+       silently clobbering newer content.
+    3. **Net-deletion guard** — if the edit would shrink the file by
+       ≥30% of bytes or ≥40 lines, refuse unless
+       `allow_large_deletion=True`.
+    4. **Snapshot before write** — the prior bytes are copied into the
+       state dir so `undo_last_edit(path)` can roll back.
+    5. **Atomic write** — a sibling tempfile + `os.replace` so a
+       crash mid-write can't truncate the target.
+
+    On success, the response includes a unified diff so the agent can
+    self-check what landed.
 
     Args:
         path: Existing file inside the workspace.
         old_string: Exact string to find. Must occur exactly once.
         new_string: Replacement string.
+        allow_large_deletion: Bypass the net-deletion guard. Use only
+            when the deletion is genuinely intended.
 
     Returns:
-        Success dict with `path` on replacement, or an error if `old_string`
-        is missing or appears multiple times.
+        On success: `{"status": "success", "path", "diff", "snapshot"}`.
+        On any safety violation or IO failure: an error dict.
     """
     try:
         target = resolve_in_workspace(path)
@@ -116,10 +234,33 @@ def edit_file(path: str, old_string: str, new_string: str) -> dict:
         return _err(str(e))
     if not target.is_file():
         return _err(f"Not a file: {path}")
+
+    if len(old_string) < EDIT_ANCHOR_MIN_LEN and "\n" not in old_string:
+        return _err(
+            "old_string is too short to safely anchor; include at least "
+            "2 lines of surrounding context (or a string of at least "
+            f"{EDIT_ANCHOR_MIN_LEN} characters)."
+        )
+
     try:
-        original = target.read_text(encoding="utf-8")
+        original_bytes = target.read_bytes()
+        original = original_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError) as e:
         return _err(f"Read failed: {e}")
+
+    cached_sha = _file_read_cache.get(str(target))
+    current_sha = _compute_sha(original_bytes)
+    if cached_sha is None:
+        return _err(
+            "edit_file: read the file first with read_file so I can "
+            "verify it didn't change out from under you."
+        )
+    if cached_sha != current_sha:
+        return _err(
+            "edit_file: file changed since last read; re-read with "
+            "read_file before editing."
+        )
+
     occurrences = original.count(old_string)
     if occurrences == 0:
         return _err("old_string not found in file.")
@@ -128,12 +269,71 @@ def edit_file(path: str, old_string: str, new_string: str) -> dict:
             f"old_string is not unique ({occurrences} matches). "
             "Provide more surrounding context."
         )
+
     updated = original.replace(old_string, new_string, 1)
+
+    deleted_bytes = max(0, len(original) - len(updated))
+    deleted_lines = max(0, original.count("\n") - updated.count("\n"))
+    if not allow_large_deletion and (
+        (deleted_bytes / max(1, len(original))) >= EDIT_DELETE_RATIO_THRESHOLD
+        or deleted_lines >= EDIT_DELETE_LINES_THRESHOLD
+    ):
+        ratio = deleted_bytes / max(1, len(original))
+        return _err(
+            f"edit_file: this edit would remove {deleted_bytes} bytes "
+            f"({ratio:.0%} of file) / {deleted_lines} lines. If "
+            "intended, pass allow_large_deletion=True."
+        )
+
+    snap = _save_snapshot(target, original_bytes)
     try:
-        target.write_text(updated, encoding="utf-8")
+        _atomic_write(target, updated)
     except OSError as e:
         return _err(f"Write failed: {e}")
-    return _ok(path=str(target))
+
+    _file_read_cache[str(target)] = _compute_sha(updated.encode("utf-8"))
+    return _ok(
+        path=str(target),
+        diff=_make_diff(original, updated, path),
+        snapshot=str(snap),
+    )
+
+
+def undo_last_edit(path: str) -> dict:
+    """Restore a file from its most recent pre-edit snapshot.
+
+    Use this immediately after an `edit_file` you realised was wrong.
+    The matching snapshot is removed once restored, so calling this
+    repeatedly walks backward through the snapshot history (one step
+    per call) until none remain.
+
+    Args:
+        path: Workspace path that was previously edited.
+
+    Returns:
+        On success: `{"status": "success", "path", "restored_from"}`.
+        On error: `{"status": "error", ...}` (e.g. no snapshot found).
+    """
+    try:
+        target = resolve_in_workspace(path)
+    except ValueError as e:
+        return _err(str(e))
+    sha_prefix = _path_hash(target)
+    snaps = sorted(
+        _snapshot_dir().glob(f"{sha_prefix}-*"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not snaps:
+        return _err(f"No snapshot found for {path}.")
+    latest = snaps[-1]
+    try:
+        prior = latest.read_bytes()
+        _atomic_write(target, prior.decode("utf-8"))
+        latest.unlink()
+    except (OSError, UnicodeDecodeError) as e:
+        return _err(f"Restore failed: {e}")
+    _file_read_cache[str(target)] = _compute_sha(prior)
+    return _ok(path=str(target), restored_from=str(latest))
 
 
 def list_dir(path: str = ".") -> dict:
@@ -419,6 +619,7 @@ ALL_TOOLS = [
     read_file,
     write_file,
     edit_file,
+    undo_last_edit,
     list_dir,
     glob_files,
     grep,
