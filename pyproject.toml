@@ -20,11 +20,21 @@ dev = [
     "pytest-asyncio>=0.23.8,<1.0.0",
     "nest-asyncio>=1.6.0,<2.0.0",
 ]
-
-[project.optional-dependencies]
-discord = [
+# Channel dependencies live in a dependency group (not an `optional-dependencies`
+# extra) so `[tool.uv] default-groups` below can keep them installed across
+# every `uv sync`. Otherwise `agents-cli lint` (which runs `uv sync --dev
+# --extra lint`) would prune them, breaking `python -m app.channels.discord`.
+channels = [
     "discord.py>=2.5,<3",
 ]
+
+[tool.uv]
+# Always include `dev` (tests) and `channels` (Discord bot, future Slack/etc.)
+# unless the caller explicitly passes `--no-default-groups`. Production
+# deployments that don't need channel adapters can opt out at sync time.
+default-groups = ["dev", "channels"]
+
+[project.optional-dependencies]
 eval = [
     "google-adk[eval]>=1.15.0,<2.0.0",
 ]

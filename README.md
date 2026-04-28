@@ -95,13 +95,14 @@ the agent. The shared `app/channels/base.py` wraps an ADK `Runner` and
 Run as its own process:
 
 ```bash
-uv sync --extra discord
 uv run python -m app.channels.discord
 ```
 
 The bot reads `DISCORD_BOT_TOKEN` (and the GCP env vars) from `.env`
 automatically — no shell sourcing required. Channels auto-load `.env`
-the same way `agents-cli` does.
+the same way `agents-cli` does. `discord.py` is part of the `channels`
+default dependency group, so `agents-cli install` (or any `uv sync`)
+keeps it installed.
 
 Setup:
 

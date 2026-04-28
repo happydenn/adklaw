@@ -49,8 +49,8 @@ class DiscordChannel(ChannelBase):
             import discord
         except ModuleNotFoundError as e:
             raise SystemExit(
-                "discord.py is not installed. Run `uv sync --extra discord` "
-                "and try again."
+                "discord.py is not installed. Run `uv sync` (the `channels` "
+                "dependency group is installed by default) and try again."
             ) from e
 
         intents = discord.Intents.default()
