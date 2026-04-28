@@ -84,6 +84,23 @@ The template at `templates/AGENTS.md` is the canonical seed. Edit it
 in the repo if you want to change what new workspaces start with;
 existing workspaces aren't touched.
 
+### Web search
+
+The `web_search` tool calls Gemini 2.5 Flash-Lite with Google Search
+grounding ([docs](https://ai.google.dev/gemini-api/docs/grounding))
+and returns a synthesized answer plus the list of cited source URLs.
+Two env knobs:
+
+- `ADKLAW_WEB_SEARCH_MODEL` — model id; default `gemini-2.5-flash-lite`.
+- `ADKLAW_WEB_SEARCH_LATLNG` — `"lat,lng"` to bias results
+  geographically; default Taipei (`"25.0330,121.5654"`). Set to `""`
+  to disable bias. (Country / language codes aren't exposed by the
+  grounding API today; lat/lng is the available knob.)
+
+Results are charged to the same Vertex billing as the main agent
+model. Flash-Lite is cheap (sub-cent per call) — no separate API key
+or service account needed.
+
 To point the agent at a different workspace:
 
 ```bash

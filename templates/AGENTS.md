@@ -15,6 +15,10 @@ coding, file organization, shell tasks, web lookups.
 - Read, search, and edit files inside this workspace.
 - Run shell commands (`run_shell`) with this workspace as cwd.
 - Fetch text from URLs (`web_fetch`).
+- Search the web for current information (`web_search`) — uses
+  Gemini Flash-Lite + Google Search grounding to return a synthesized
+  answer plus cited source URLs. Use this before guessing facts about
+  current events, prices, releases, or anything time-sensitive.
 - Use specialized **skills** in `skills/` (see "Skills" below).
 
 ## How to behave

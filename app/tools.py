@@ -8,17 +8,28 @@ failure without raising exceptions.
 
 from __future__ import annotations
 
+import functools
+import logging
+import os
 import re
 import subprocess
 import urllib.error
 import urllib.request
 
+from google import genai
+from google.genai import types
+
 from .workspace import get_workspace, resolve_in_workspace
+
+logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 1_000_000  # 1 MB read cap
 MAX_GREP_RESULTS = 200
 MAX_FETCH_BYTES = 2_000_000  # 2 MB fetch cap
 SHELL_TIMEOUT_SECONDS = 60
+
+WEB_SEARCH_MODEL_DEFAULT = "gemini-2.5-flash-lite"
+WEB_SEARCH_LATLNG_DEFAULT = "25.0330,121.5654"  # Taipei
 
 
 def _ok(**fields) -> dict:
@@ -301,6 +312,109 @@ def web_fetch(url: str) -> dict:
     )
 
 
+@functools.cache
+def _web_search_client() -> genai.Client:
+    """Lazy module-level genai client for web_search.
+
+    Cached so we construct the client (and dial Vertex auth) at most
+    once per process. Tests clear this cache via the autouse fixture
+    in `tests/conftest.py`.
+    """
+    return genai.Client()
+
+
+def _parse_latlng(raw: str) -> types.LatLng | None:
+    """Parse a `"lat,lng"` env var into a `types.LatLng`.
+
+    Empty / blank string → no geographic bias. Malformed input → log
+    a warning and fall back to no bias rather than failing the search.
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        lat_str, lng_str = raw.split(",", 1)
+        return types.LatLng(
+            latitude=float(lat_str.strip()), longitude=float(lng_str.strip())
+        )
+    except (ValueError, AttributeError):
+        logger.warning(
+            "Invalid ADKLAW_WEB_SEARCH_LATLNG=%r; expected `lat,lng`. "
+            "Falling back to no geographic bias.",
+            raw,
+        )
+        return None
+
+
+def web_search(query: str) -> dict:
+    """Search the web via Gemini Flash-Lite with Google Search grounding.
+
+    Returns a synthesized answer plus the list of cited sources.
+    Geographic bias is set by `ADKLAW_WEB_SEARCH_LATLNG` (default
+    Taipei `"25.0330,121.5654"`; empty string disables).
+
+    Args:
+        query: Free-form search query in any language.
+
+    Returns:
+        On success: `{"status": "success", "query": str, "answer": str,
+        "sources": [{"title": str, "url": str}, ...],
+        "search_queries": [str, ...]}`. On error: a `_err` dict.
+    """
+    if not query.strip():
+        return _err("query must be non-empty")
+    model = os.environ.get("ADKLAW_WEB_SEARCH_MODEL", WEB_SEARCH_MODEL_DEFAULT)
+    latlng = _parse_latlng(
+        os.environ.get("ADKLAW_WEB_SEARCH_LATLNG", WEB_SEARCH_LATLNG_DEFAULT)
+    )
+    config_kwargs: dict = {
+        "tools": [types.Tool(google_search=types.GoogleSearch())],
+    }
+    if latlng is not None:
+        config_kwargs["tool_config"] = types.ToolConfig(
+            retrieval_config=types.RetrievalConfig(lat_lng=latlng),
+        )
+    try:
+        response = _web_search_client().models.generate_content(
+            model=model,
+            contents=query,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+    except Exception as e:
+        return _err(f"Search failed: {e}")
+
+    answer = (response.text or "").strip()
+    if not answer:
+        return _err("Search returned no text (possibly blocked).")
+
+    sources: list[dict] = []
+    queries: list[str] = []
+    candidates = response.candidates or []
+    cand = candidates[0] if candidates else None
+    gm = getattr(cand, "grounding_metadata", None) if cand else None
+    if gm is not None:
+        seen: set[str] = set()
+        for chunk in (getattr(gm, "grounding_chunks", None) or []):
+            web = getattr(chunk, "web", None)
+            if web is None:
+                continue
+            url = getattr(web, "uri", None) or ""
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            sources.append(
+                {"title": getattr(web, "title", "") or "", "url": url}
+            )
+        queries = list(getattr(gm, "web_search_queries", None) or [])
+
+    return _ok(
+        query=query,
+        answer=answer,
+        sources=sources,
+        search_queries=queries,
+    )
+
+
 ALL_TOOLS = [
     read_file,
     write_file,
@@ -310,4 +424,5 @@ ALL_TOOLS = [
     grep,
     run_shell,
     web_fetch,
+    web_search,
 ]

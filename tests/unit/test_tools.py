@@ -1,4 +1,4 @@
-"""Tests for `app.tools` — file IO, shell, and web_fetch tools."""
+"""Tests for `app.tools` — file IO, shell, web_fetch, and web_search tools."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -20,6 +22,7 @@ from app.tools import (
     read_file,
     run_shell,
     web_fetch,
+    web_search,
     write_file,
 )
 
@@ -283,3 +286,186 @@ def test_web_fetch_truncates(stub_server: str) -> None:
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["text"]) <= MAX_FETCH_BYTES
+
+
+# ---------------------------------------------------------------------------
+# web_search — Gemini Flash-Lite + Google Search grounding
+# ---------------------------------------------------------------------------
+
+
+def _fake_response(
+    *,
+    text: str,
+    sources: list[tuple[str, str]] | None = None,
+    queries: list[str] | None = None,
+    has_grounding: bool = True,
+) -> Any:
+    """Build a SimpleNamespace shaped like a `genai` response object."""
+    if has_grounding:
+        chunks = [
+            SimpleNamespace(web=SimpleNamespace(uri=url, title=title))
+            for title, url in (sources or [])
+        ]
+        gm = SimpleNamespace(
+            grounding_chunks=chunks,
+            web_search_queries=queries or [],
+        )
+    else:
+        gm = None
+    candidate = SimpleNamespace(grounding_metadata=gm)
+    return SimpleNamespace(text=text, candidates=[candidate])
+
+
+class _RecordingClient:
+    """Stand-in for `genai.Client` that records the last `generate_content`
+    call kwargs and returns a fixed response."""
+
+    def __init__(self, response: Any | Exception) -> None:
+        self._response = response
+        self.last_kwargs: dict[str, Any] | None = None
+        self.models = SimpleNamespace(generate_content=self._generate_content)
+
+    def _generate_content(self, **kwargs: Any) -> Any:
+        self.last_kwargs = kwargs
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+@pytest.fixture
+def _patch_client(monkeypatch: pytest.MonkeyPatch):
+    """Patch `_web_search_client` to return a `_RecordingClient` we control."""
+
+    def _factory(response: Any | Exception) -> _RecordingClient:
+        client = _RecordingClient(response)
+        monkeypatch.setattr(tools, "_web_search_client", lambda: client)
+        return client
+
+    return _factory
+
+
+def test_web_search_happy_with_grounding(_patch_client) -> None:
+    client = _patch_client(
+        _fake_response(
+            text="The capital is Taipei.",
+            sources=[
+                ("Wikipedia: Taipei", "https://en.wikipedia.org/wiki/Taipei"),
+                ("CIA Factbook: Taiwan", "https://www.cia.gov/the-world-factbook/countries/taiwan/"),
+            ],
+            queries=["capital of taiwan"],
+        )
+    )
+    result = web_search("What is the capital of Taiwan?")
+    assert result["status"] == "success"
+    assert result["answer"] == "The capital is Taipei."
+    assert len(result["sources"]) == 2
+    assert result["sources"][0]["url"].startswith("https://en.wikipedia.org")
+    assert result["sources"][0]["title"] == "Wikipedia: Taipei"
+    assert result["search_queries"] == ["capital of taiwan"]
+    assert client.last_kwargs is not None
+
+
+def test_web_search_happy_no_grounding(_patch_client) -> None:
+    _patch_client(
+        _fake_response(text="Paris.", has_grounding=False)
+    )
+    result = web_search("capital of france?")
+    assert result["status"] == "success"
+    assert result["answer"] == "Paris."
+    assert result["sources"] == []
+    assert result["search_queries"] == []
+
+
+def test_web_search_dedupes_duplicate_urls(_patch_client) -> None:
+    _patch_client(
+        _fake_response(
+            text="Yes.",
+            sources=[
+                ("First", "https://example.com/x"),
+                ("Second", "https://example.com/x"),
+                ("Third", "https://example.com/y"),
+            ],
+        )
+    )
+    result = web_search("anything")
+    urls = [s["url"] for s in result["sources"]]
+    assert urls == ["https://example.com/x", "https://example.com/y"]
+
+
+def test_web_search_empty_query_errors(_patch_client) -> None:
+    client = _patch_client(_fake_response(text="should not run"))
+    result = web_search("   ")
+    assert result["status"] == "error"
+    assert "non-empty" in result["error"]
+    assert client.last_kwargs is None  # client never called
+
+
+def test_web_search_blocked_response_errors(_patch_client) -> None:
+    _patch_client(_fake_response(text="", has_grounding=False))
+    result = web_search("anything")
+    assert result["status"] == "error"
+    assert "no text" in result["error"].lower()
+
+
+def test_web_search_sdk_raises_returns_error(_patch_client) -> None:
+    _patch_client(RuntimeError("vertex on fire"))
+    result = web_search("anything")
+    assert result["status"] == "error"
+    assert "vertex on fire" in result["error"]
+
+
+def test_web_search_uses_env_model_override(
+    _patch_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ADKLAW_WEB_SEARCH_MODEL", "alt-model")
+    client = _patch_client(_fake_response(text="ok"))
+    web_search("anything")
+    assert client.last_kwargs["model"] == "alt-model"
+
+
+def test_web_search_default_latlng_is_taipei(_patch_client) -> None:
+    client = _patch_client(_fake_response(text="ok"))
+    web_search("anything")
+    config = client.last_kwargs["config"]
+    tool_config = config.tool_config
+    lat_lng = tool_config.retrieval_config.lat_lng
+    assert abs(lat_lng.latitude - 25.0330) < 1e-6
+    assert abs(lat_lng.longitude - 121.5654) < 1e-6
+
+
+def test_web_search_latlng_override(
+    _patch_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ADKLAW_WEB_SEARCH_LATLNG", "37.4220,-122.0841")
+    client = _patch_client(_fake_response(text="ok"))
+    web_search("anything")
+    lat_lng = client.last_kwargs["config"].tool_config.retrieval_config.lat_lng
+    assert abs(lat_lng.latitude - 37.4220) < 1e-6
+    assert abs(lat_lng.longitude - (-122.0841)) < 1e-6
+
+
+def test_web_search_latlng_empty_disables_bias(
+    _patch_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ADKLAW_WEB_SEARCH_LATLNG", "")
+    client = _patch_client(_fake_response(text="ok"))
+    web_search("anything")
+    config = client.last_kwargs["config"]
+    assert config.tool_config is None
+
+
+def test_web_search_latlng_invalid_falls_through(
+    _patch_client,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    monkeypatch.setenv("ADKLAW_WEB_SEARCH_LATLNG", "not-a-coord")
+    client = _patch_client(_fake_response(text="ok"))
+    with caplog.at_level(logging.WARNING, logger="app.tools"):
+        result = web_search("anything")
+    assert result["status"] == "success"
+    config = client.last_kwargs["config"]
+    assert config.tool_config is None
+    assert any("not-a-coord" in r.message for r in caplog.records)
