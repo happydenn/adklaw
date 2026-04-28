@@ -89,6 +89,61 @@ def _allowlist_scope() -> str:
     return raw
 
 
+def _parse_bool(raw: str, *, default: bool, var: str) -> bool:
+    """Permissive bool parser shared by the bot-handling toggles.
+
+    Accepts true/false, 1/0, yes/no (case-insensitive). Empty string →
+    default. Anything else → log a warning and return the default.
+    """
+    s = raw.strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    if s == "":
+        return default
+    logger.warning("Unknown %s=%r; defaulting to %s.", var, raw, default)
+    return default
+
+
+@functools.cache
+def _reply_to_bots() -> bool:
+    """Whether to reply to @-mentions from other bots (webhooks,
+    bridges, integrations, friendly bots).
+
+    Default false: blocks bot-to-bot ping-pong. Self-bot messages are
+    always skipped, regardless of this toggle. Pair with
+    `DISCORD_ALLOWED_USER_IDS` + `DISCORD_ALLOWLIST_SCOPE=all` for
+    fine-grained restriction to specific bots.
+    """
+    return _parse_bool(
+        os.environ.get("DISCORD_REPLY_TO_BOTS", ""),
+        default=False,
+        var="DISCORD_REPLY_TO_BOTS",
+    )
+
+
+@functools.cache
+def _quote_bot_replies() -> bool:
+    """Whether to use `message.reply(...)` (quoted reference) when the
+    original author is a bot.
+
+    Default false → use plain `channel.send(...)`, so the response
+    carries no implicit mention or `MessageReference` pointing back at
+    the other bot. This is the recommended config when
+    `DISCORD_REPLY_TO_BOTS=true`: it prevents the most common form of
+    bot-to-bot ping-pong (the other bot triggering on a mention of
+    itself in our reply chain). Set true if you specifically want the
+    visual quote and accept the loop risk. Has no effect on responses
+    to human authors — those always use `message.reply(...)`.
+    """
+    return _parse_bool(
+        os.environ.get("DISCORD_QUOTE_BOT_REPLIES", ""),
+        default=False,
+        var="DISCORD_QUOTE_BOT_REPLIES",
+    )
+
+
 class DiscordChannel(ChannelBase):
     """Discord adapter for adklaw."""
 
@@ -233,8 +288,18 @@ class DiscordChannel(ChannelBase):
         # are valuable conversational context for the next mention.
         self._record_in_buffer(message)
 
-        # Ignore our own messages and other bots.
-        if message.author.bot:
+        # Always skip our own messages — prevents self-loops regardless
+        # of any other toggle.
+        if (
+            self._client.user is not None
+            and message.author.id == self._client.user.id
+        ):
+            return
+
+        # Other bots only respond when explicitly opted in. Pair with
+        # DISCORD_ALLOWED_USER_IDS + DISCORD_ALLOWLIST_SCOPE=all to
+        # restrict which bots can trigger replies.
+        if message.author.bot and not _reply_to_bots():
             return
 
         is_dm = message.guild is None
@@ -311,6 +376,19 @@ class DiscordChannel(ChannelBase):
         if not is_dm:
             context = await self._build_context(message)
 
+        # When responding to another bot, default to a plain
+        # `channel.send(...)` so the response carries no `MessageReference`
+        # mention back at the other bot. Human authors always get the
+        # quoted reply (current behaviour).
+        author_is_bot = message.author.bot
+        use_quoted_reply = (not author_is_bot) or _quote_bot_replies()
+
+        async def _send(text: str) -> None:
+            if use_quoted_reply:
+                await message.reply(text)
+            else:
+                await message.channel.send(text)
+
         try:
             async with message.channel.typing():
                 response = await self.handle_message(
@@ -322,18 +400,18 @@ class DiscordChannel(ChannelBase):
                 )
         except Exception:
             logger.exception("Agent run failed for Discord message %s", message.id)
-            await message.reply(
+            await _send(
                 "Sorry — something went wrong handling that message. "
                 "Check the bot logs."
             )
             return
 
         if not response:
-            await message.reply("(no response)")
+            await _send("(no response)")
             return
 
         for chunk in _split_for_discord(response):
-            await message.reply(chunk)
+            await _send(chunk)
 
     def run(self) -> None:
         """Block on the Discord client. Returns when the bot disconnects."""

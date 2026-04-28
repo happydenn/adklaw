@@ -51,6 +51,7 @@ class _FakeChannel:
     history_messages: list[Any] = field(default_factory=list)
     history_calls: list[dict[str, Any]] = field(default_factory=list)
     history_raises: BaseException | None = None
+    sends: list[str] = field(default_factory=list)
 
     def typing(self) -> Any:
         @asynccontextmanager
@@ -58,6 +59,12 @@ class _FakeChannel:
             yield
 
         return _cm()
+
+    async def send(self, text: str) -> None:
+        """Mimic `discord.TextChannel.send` — records each call so tests
+        can assert the response went out as a plain channel message
+        (no `MessageReference`) rather than a quoted reply."""
+        self.sends.append(text)
 
     def history(self, *, limit: int, before: Any) -> Any:
         """Mimic `discord.TextChannel.history` — returns an async iterator
@@ -171,6 +178,129 @@ async def test_bot_message_ignored(channel: DiscordChannel) -> None:
     await channel._on_message(msg)  # type: ignore[arg-type]
     assert msg.replies == []
     channel.handle_message.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_bot_mention_ignored_by_default(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default `DISCORD_REPLY_TO_BOTS=false` blocks bot-authored guild
+    mentions entirely."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.delenv("DISCORD_REPLY_TO_BOTS", raising=False)
+
+    msg = _make_message(
+        sender_id=1, content="hi", is_dm=False, bot=True, mention_bot=channel
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    assert msg.replies == []
+    assert msg.channel.sends == []
+    channel.handle_message.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_bot_mention_replies_via_channel_send_when_toggle_on(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`DISCORD_REPLY_TO_BOTS=true` opens the gate; with the quote
+    toggle off (default), the response goes out via `channel.send`,
+    not `message.reply` — no `MessageReference` to ping the other bot."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "true")
+    monkeypatch.delenv("DISCORD_QUOTE_BOT_REPLIES", raising=False)
+
+    msg = _make_message(
+        sender_id=1, content="hi", is_dm=False, bot=True, mention_bot=channel
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    assert msg.replies == []
+    assert msg.channel.sends == ["agent reply"]
+
+
+@pytest.mark.asyncio
+async def test_bot_mention_with_quote_toggle_uses_message_reply(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`DISCORD_QUOTE_BOT_REPLIES=true` opts back into the quoted
+    reply for bot authors."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "true")
+    monkeypatch.setenv("DISCORD_QUOTE_BOT_REPLIES", "true")
+
+    msg = _make_message(
+        sender_id=1, content="hi", is_dm=False, bot=True, mention_bot=channel
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    assert msg.replies == ["agent reply"]
+    assert msg.channel.sends == []
+
+
+@pytest.mark.asyncio
+async def test_human_mention_always_uses_message_reply(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quote toggle only affects bot authors. Humans always get
+    `message.reply(...)` regardless of `DISCORD_QUOTE_BOT_REPLIES`."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_QUOTE_BOT_REPLIES", "false")
+
+    msg = _make_message(
+        sender_id=1, content="hi", is_dm=False, mention_bot=channel
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    channel.handle_message.assert_called_once()  # type: ignore[attr-defined]
+    assert msg.replies == ["agent reply"]
+    assert msg.channel.sends == []
+
+
+@pytest.mark.asyncio
+async def test_self_bot_always_skipped_even_when_toggle_on(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Self-bot messages never wake the agent, regardless of toggles —
+    the self-loop guard is independent of `DISCORD_REPLY_TO_BOTS`."""
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "true")
+
+    self_id = _bot_user_for(channel).id
+    msg = _make_message(
+        sender_id=self_id,
+        content="hi",
+        is_dm=False,
+        bot=True,
+        mention_bot=channel,
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    assert msg.replies == []
+    assert msg.channel.sends == []
+    channel.handle_message.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_bot_mention_with_toggle_on_still_respects_allowlist(
+    channel: DiscordChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even with the gate open, `DISCORD_ALLOWLIST_SCOPE=all` plus a
+    user-ID allowlist still drops bot-authored mentions whose id isn't
+    on the list. No notice is posted to the public channel."""
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", "999999")
+    monkeypatch.setenv("DISCORD_ALLOWLIST_SCOPE", "all")
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "true")
+    from app.channels.discord import _allowed_user_ids, _allowlist_scope
+
+    _allowed_user_ids.cache_clear()
+    _allowlist_scope.cache_clear()
+
+    msg = _make_message(
+        sender_id=1, content="hi", is_dm=False, bot=True, mention_bot=channel
+    )
+    await channel._on_message(msg)  # type: ignore[arg-type]
+    assert msg.replies == []
+    assert msg.channel.sends == []
+    channel.handle_message.assert_not_called()  # type: ignore[attr-defined]
+    assert "1" not in channel._notified_disallowed
 
 
 @pytest.mark.asyncio

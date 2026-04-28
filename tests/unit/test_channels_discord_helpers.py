@@ -10,6 +10,8 @@ from app.channels.discord import (
     _allowed_user_ids,
     _allowlist_scope,
     _history_limit,
+    _quote_bot_replies,
+    _reply_to_bots,
     _split_for_discord,
 )
 
@@ -140,3 +142,87 @@ def test_history_limit_invalid_falls_back(
     with caplog.at_level(logging.WARNING, logger="app.channels.discord"):
         assert _history_limit() == DEFAULT_HISTORY_LINES
     assert any("wat" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# _reply_to_bots / _quote_bot_replies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("True", True),
+        ("1", True),
+        ("yes", True),
+        ("YES", True),
+        ("false", False),
+        ("FALSE", False),
+        ("0", False),
+        ("no", False),
+    ],
+)
+def test_reply_to_bots_parses_truthy_and_falsy(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+) -> None:
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", raw)
+    assert _reply_to_bots() is expected
+
+
+def test_reply_to_bots_default_is_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DISCORD_REPLY_TO_BOTS", raising=False)
+    assert _reply_to_bots() is False
+
+
+def test_reply_to_bots_blank_is_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "   ")
+    assert _reply_to_bots() is False
+
+
+def test_reply_to_bots_invalid_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    monkeypatch.setenv("DISCORD_REPLY_TO_BOTS", "maybe")
+    with caplog.at_level(logging.WARNING, logger="app.channels.discord"):
+        assert _reply_to_bots() is False
+    assert any("maybe" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+    ],
+)
+def test_quote_bot_replies_parses_truthy_and_falsy(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: bool
+) -> None:
+    monkeypatch.setenv("DISCORD_QUOTE_BOT_REPLIES", raw)
+    assert _quote_bot_replies() is expected
+
+
+def test_quote_bot_replies_default_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DISCORD_QUOTE_BOT_REPLIES", raising=False)
+    assert _quote_bot_replies() is False
+
+
+def test_quote_bot_replies_invalid_falls_back_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    monkeypatch.setenv("DISCORD_QUOTE_BOT_REPLIES", "kinda")
+    with caplog.at_level(logging.WARNING, logger="app.channels.discord"):
+        assert _quote_bot_replies() is False
+    assert any("kinda" in r.message for r in caplog.records)

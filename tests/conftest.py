@@ -40,11 +40,15 @@ def _clear_caches() -> None:
         _allowed_user_ids,
         _allowlist_scope,
         _history_limit,
+        _quote_bot_replies,
+        _reply_to_bots,
     )
     from app.tools import _web_search_client
 
     _allowed_user_ids.cache_clear()
     _allowlist_scope.cache_clear()
     _history_limit.cache_clear()
+    _quote_bot_replies.cache_clear()
+    _reply_to_bots.cache_clear()
     _web_search_client.cache_clear()
     workspace_module._warned_no_agents_md = False

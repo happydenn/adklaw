@@ -178,6 +178,21 @@ invited it to is implicitly trusted). To gate guild mentions too,
 set `DISCORD_ALLOWLIST_SCOPE=all`. Valid values are `dm` (default)
 and `all`.
 
+**Replying to other bots.** By default the bot ignores any message
+whose author is itself a bot (webhooks, bridges like PluralKit / IRC
+relays, GitHub/news integrations, friendly bots). This blocks
+bot-to-bot ping-pong loops. To opt in, set
+`DISCORD_REPLY_TO_BOTS=true`. The bot's own messages are always
+skipped regardless of this toggle. When this is on, the response is
+delivered as a plain `channel.send(...)` rather than a quoted
+`message.reply(...)` — that way the response carries no implicit
+mention or `MessageReference` pointing back at the other bot, which
+would otherwise re-trigger it. Set `DISCORD_QUOTE_BOT_REPLIES=true`
+if you specifically want the visual quote (and accept the loop
+risk). Pair with `DISCORD_ALLOWED_USER_IDS` +
+`DISCORD_ALLOWLIST_SCOPE=all` to restrict which bots can wake the
+agent.
+
 **Conversation context backfill in channels.** When the bot is
 mentioned in a guild channel, it backfills the recent message history
 so the agent can follow the conversation flow rather than seeing only
