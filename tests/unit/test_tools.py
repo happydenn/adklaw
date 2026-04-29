@@ -479,24 +479,27 @@ def test_grep_invalid_regex(workspace_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_shell_echo(workspace_dir: Path) -> None:
-    result = run_shell("echo hi")
+@pytest.mark.asyncio
+async def test_run_shell_echo(workspace_dir: Path) -> None:
+    result = await run_shell("echo hi")
     assert result["status"] == "success"
     assert result["exit_code"] == 0
     assert result["stdout"] == "hi\n"
 
 
-def test_run_shell_cwd_is_workspace(workspace_dir: Path) -> None:
-    result = run_shell("pwd")
+@pytest.mark.asyncio
+async def test_run_shell_cwd_is_workspace(workspace_dir: Path) -> None:
+    result = await run_shell("pwd")
     assert result["status"] == "success"
     assert result["stdout"].strip() == str(workspace_dir)
 
 
-def test_run_shell_timeout(
+@pytest.mark.asyncio
+async def test_run_shell_timeout(
     workspace_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(tools, "SHELL_TIMEOUT_SECONDS", 1)
-    result = run_shell("sleep 5")
+    result = await run_shell("sleep 5")
     assert result["status"] == "error"
     assert "timed out" in result["error"]
 
@@ -709,7 +712,8 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch):
     return _factory
 
 
-def test_web_search_happy_with_grounding(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_happy_with_grounding(_patch_client) -> None:
     client = _patch_client(
         _fake_response(
             text="The capital is Taipei.",
@@ -720,7 +724,7 @@ def test_web_search_happy_with_grounding(_patch_client) -> None:
             queries=["capital of taiwan"],
         )
     )
-    result = web_search("What is the capital of Taiwan?")
+    result = await web_search("What is the capital of Taiwan?")
     assert result["status"] == "success"
     assert result["answer"] == "The capital is Taipei."
     assert len(result["sources"]) == 2
@@ -730,18 +734,20 @@ def test_web_search_happy_with_grounding(_patch_client) -> None:
     assert client.last_kwargs is not None
 
 
-def test_web_search_happy_no_grounding(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_happy_no_grounding(_patch_client) -> None:
     _patch_client(
         _fake_response(text="Paris.", has_grounding=False)
     )
-    result = web_search("capital of france?")
+    result = await web_search("capital of france?")
     assert result["status"] == "success"
     assert result["answer"] == "Paris."
     assert result["sources"] == []
     assert result["search_queries"] == []
 
 
-def test_web_search_dedupes_duplicate_urls(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_dedupes_duplicate_urls(_patch_client) -> None:
     _patch_client(
         _fake_response(
             text="Yes.",
@@ -752,45 +758,50 @@ def test_web_search_dedupes_duplicate_urls(_patch_client) -> None:
             ],
         )
     )
-    result = web_search("anything")
+    result = await web_search("anything")
     urls = [s["url"] for s in result["sources"]]
     assert urls == ["https://example.com/x", "https://example.com/y"]
 
 
-def test_web_search_empty_query_errors(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_empty_query_errors(_patch_client) -> None:
     client = _patch_client(_fake_response(text="should not run"))
-    result = web_search("   ")
+    result = await web_search("   ")
     assert result["status"] == "error"
     assert "non-empty" in result["error"]
     assert client.last_kwargs is None  # client never called
 
 
-def test_web_search_blocked_response_errors(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_blocked_response_errors(_patch_client) -> None:
     _patch_client(_fake_response(text="", has_grounding=False))
-    result = web_search("anything")
+    result = await web_search("anything")
     assert result["status"] == "error"
     assert "no text" in result["error"].lower()
 
 
-def test_web_search_sdk_raises_returns_error(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_sdk_raises_returns_error(_patch_client) -> None:
     _patch_client(RuntimeError("vertex on fire"))
-    result = web_search("anything")
+    result = await web_search("anything")
     assert result["status"] == "error"
     assert "vertex on fire" in result["error"]
 
 
-def test_web_search_uses_env_model_override(
+@pytest.mark.asyncio
+async def test_web_search_uses_env_model_override(
     _patch_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ADKLAW_WEB_SEARCH_MODEL", "alt-model")
     client = _patch_client(_fake_response(text="ok"))
-    web_search("anything")
+    await web_search("anything")
     assert client.last_kwargs["model"] == "alt-model"
 
 
-def test_web_search_default_latlng_is_taipei(_patch_client) -> None:
+@pytest.mark.asyncio
+async def test_web_search_default_latlng_is_taipei(_patch_client) -> None:
     client = _patch_client(_fake_response(text="ok"))
-    web_search("anything")
+    await web_search("anything")
     config = client.last_kwargs["config"]
     tool_config = config.tool_config
     lat_lng = tool_config.retrieval_config.lat_lng
@@ -798,28 +809,31 @@ def test_web_search_default_latlng_is_taipei(_patch_client) -> None:
     assert abs(lat_lng.longitude - 121.5654) < 1e-6
 
 
-def test_web_search_latlng_override(
+@pytest.mark.asyncio
+async def test_web_search_latlng_override(
     _patch_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ADKLAW_WEB_SEARCH_LATLNG", "37.4220,-122.0841")
     client = _patch_client(_fake_response(text="ok"))
-    web_search("anything")
+    await web_search("anything")
     lat_lng = client.last_kwargs["config"].tool_config.retrieval_config.lat_lng
     assert abs(lat_lng.latitude - 37.4220) < 1e-6
     assert abs(lat_lng.longitude - (-122.0841)) < 1e-6
 
 
-def test_web_search_latlng_empty_disables_bias(
+@pytest.mark.asyncio
+async def test_web_search_latlng_empty_disables_bias(
     _patch_client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ADKLAW_WEB_SEARCH_LATLNG", "")
     client = _patch_client(_fake_response(text="ok"))
-    web_search("anything")
+    await web_search("anything")
     config = client.last_kwargs["config"]
     assert config.tool_config is None
 
 
-def test_web_search_latlng_invalid_falls_through(
+@pytest.mark.asyncio
+async def test_web_search_latlng_invalid_falls_through(
     _patch_client,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -829,7 +843,7 @@ def test_web_search_latlng_invalid_falls_through(
     monkeypatch.setenv("ADKLAW_WEB_SEARCH_LATLNG", "not-a-coord")
     client = _patch_client(_fake_response(text="ok"))
     with caplog.at_level(logging.WARNING, logger="app.tools"):
-        result = web_search("anything")
+        result = await web_search("anything")
     assert result["status"] == "success"
     config = client.last_kwargs["config"]
     assert config.tool_config is None

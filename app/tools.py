@@ -4,10 +4,19 @@ All filesystem tools are rooted at the configured workspace and reject paths
 that would escape it. `run_shell` executes with the workspace as cwd. All
 tools return plain dicts so the LLM gets structured feedback on success or
 failure without raising exceptions.
+
+Concurrency note: tools that do blocking I/O (subprocess, sync HTTP /
+SDK calls) must be `async def` and offload the blocking call via
+`asyncio.to_thread`. ADK's `FunctionTool._invoke_callable` calls sync
+callables directly on the calling loop, so a sync blocking tool stalls
+whatever loop the runner is on — including the Discord client's
+heartbeat task. Pure-CPU and fast filesystem ops (capped at 1 MB here)
+can stay sync.
 """
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import functools
 import hashlib
@@ -439,7 +448,7 @@ def grep(pattern: str, path: str = ".", file_glob: str = "**/*") -> dict:
     return _ok(matches=matches, truncated=False)
 
 
-def run_shell(command: str) -> dict:
+async def run_shell(command: str) -> dict:
     """Run a shell command with the workspace as the working directory.
 
     The command runs through `/bin/sh -c`. Output is captured and returned.
@@ -454,7 +463,8 @@ def run_shell(command: str) -> dict:
     """
     workspace = get_workspace()
     try:
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             command,
             shell=True,
             cwd=str(workspace),
@@ -673,7 +683,7 @@ def _parse_latlng(raw: str) -> types.LatLng | None:
         return None
 
 
-def web_search(query: str) -> dict:
+async def web_search(query: str) -> dict:
     """Search the web via Gemini Flash-Lite with Google Search grounding.
 
     Returns a synthesized answer plus the list of cited sources.
@@ -702,7 +712,8 @@ def web_search(query: str) -> dict:
             retrieval_config=types.RetrievalConfig(lat_lng=latlng),
         )
     try:
-        response = _web_search_client().models.generate_content(
+        response = await asyncio.to_thread(
+            _web_search_client().models.generate_content,
             model=model,
             contents=query,
             config=types.GenerateContentConfig(**config_kwargs),

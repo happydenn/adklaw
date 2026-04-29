@@ -13,8 +13,9 @@ from app.tools import web_search
 
 
 @pytest.mark.live
-def test_web_search_live_returns_real_answer() -> None:
-    result = web_search("What is the capital of Taiwan?")
+@pytest.mark.asyncio
+async def test_web_search_live_returns_real_answer() -> None:
+    result = await web_search("What is the capital of Taiwan?")
     assert result["status"] == "success"
     answer = result["answer"]
     # Either English or Traditional Chinese form is acceptable —
