@@ -51,13 +51,11 @@ def test_base_instruction_does_not_document_envelopes() -> None:
 def _read_instruction(app: Any, workspace_dir: Path) -> str:
     """Resolve the agent's dynamic instruction provider with a stub
     context, returning the rendered system instruction string."""
-    provider = app.root_agent.instruction
-    # ReadonlyContext requires an `InvocationContext`; we don't actually
-    # use it because the provider only reads the workspace via env. So
-    # MagicMock-style stub is fine for these tests.
+    import asyncio
     from unittest.mock import MagicMock
 
-    return provider(MagicMock(spec=ReadonlyContext))
+    provider = app.root_agent.instruction
+    return asyncio.run(provider(MagicMock(spec=ReadonlyContext)))
 
 
 def test_build_app_appends_extra_instruction(workspace_dir: Path) -> None:

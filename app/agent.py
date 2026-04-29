@@ -25,6 +25,7 @@ from google.adk.models import Gemini
 from google.adk.tools.load_artifacts_tool import load_artifacts_tool
 from google.genai import types
 
+from .knowledge import get_knowledge_service, render_index
 from .skills import LiveSkillToolset
 from .tools import ALL_TOOLS
 from .workspace import PROJECT_ROOT, get_workspace, load_workspace_instructions
@@ -119,6 +120,41 @@ directly. Don't try to summarise a binary based on its `mime`
 and `bytes` alone — `load_artifacts` is the only way to actually
 see the content.
 
+## Tools — knowledge store
+
+You have a durable **knowledge store** for facts that should
+outlast the current session: people's identifiers, project
+conventions, deployment details, things the user has told you
+about themselves. Use it instead of relying on conversation
+history for anything you want to remember next time.
+
+If a `## Knowledge index` section appears earlier in your
+instructions, those are the entries you have already
+recorded. Consult it before answering questions about facts
+that might live there, and call `read_knowledge(slug)` when a
+listed slug looks relevant.
+
+Tools:
+- `list_knowledge()` — full index of recorded entries.
+- `read_knowledge(slug)` — full markdown content for one entry.
+- `write_knowledge(slug, summary, content)` — create or update.
+  Slug is `[a-z0-9][a-z0-9_-]*` (kebab-case). Keep the summary
+  short (~120 chars) and stable — once you've written a
+  summary, don't rewrite it just because the content changed.
+- `delete_knowledge(slug)` — remove an entry.
+
+Write knowledge when:
+- The user tells you a stable fact about themselves, the
+  project, or the world ("My Discord ID is X." "We use uv.").
+- You discovered something via tools that's useful to remember
+  (a deployment region, a config value).
+
+Don't write knowledge for:
+- Conversation context for the current task — the session
+  already has that.
+- Information that changes frequently.
+- Things already obvious from the codebase — read the code.
+
 ## Tools — skills
 
 You may have **skills** available — reusable instruction
@@ -148,23 +184,45 @@ type up front.
 
 def _instruction_provider_factory(
     extra_instruction: str,
-) -> Callable[[ReadonlyContext], str]:
-    """Build an instruction provider that appends `extra_instruction`
-    after `BASE_INSTRUCTION` and the workspace path, before any
-    workspace `*.md` customizations.
+) -> Callable[[ReadonlyContext], Any]:
+    """Build an instruction provider that composes the system
+    prompt layers in stable-prefix → volatile-tail order. See
+    `docs/instruction-layering.md` for the full rationale.
 
-    The provider is rebuilt each turn so workspace `*.md` edits take
-    effect on the very next message without restarting the agent.
+    Layer ordering (most-stable first):
+      1. BASE_INSTRUCTION                (codebase, hardcoded)
+      2. Channel `extra_instruction`     (codebase, hardcoded)
+      3. Current workspace: <path>       (stable per session)
+      4. Workspace AGENTS.md + other .md (live-editable)
+      5. KNOWLEDGE index                 (mid-session mutable)
+
+    The provider is rebuilt each turn so live-edits to AGENTS.md /
+    *.md / .knowledge/ take effect on the very next message
+    without restarting the agent.
     """
 
-    def _provider(ctx: ReadonlyContext) -> str:
-        workspace = get_workspace()
-        parts = [BASE_INSTRUCTION, f"Current workspace: `{workspace}`"]
+    async def _provider(ctx: ReadonlyContext) -> str:
+        parts: list[str] = [BASE_INSTRUCTION]
         if extra_instruction:
             parts.append(extra_instruction)
+        parts.append(f"Current workspace: `{get_workspace()}`")
         custom = load_workspace_instructions()
         if custom:
             parts.append("# Workspace customizations\n\n" + custom)
+        try:
+            entries = await get_knowledge_service().list_knowledge()
+            index = render_index(entries)
+        except Exception:
+            # A broken knowledge backend should not break the agent.
+            # Surface the failure in logs but render an empty index.
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "knowledge index render failed; using empty index"
+            )
+            index = ""
+        if index:
+            parts.append(index)
         return "\n\n".join(parts)
 
     return _provider

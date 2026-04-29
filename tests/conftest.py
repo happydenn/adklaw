@@ -53,9 +53,11 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
         _quote_bot_replies,
         _reply_to_bots,
     )
+    from app.knowledge.service import _build_service
     from app.tools import _send_file_max_bytes, _web_search_client
 
     _allowed_user_ids.cache_clear()
+    _build_service.cache_clear()
     _allowlist_scope.cache_clear()
     _attachment_max_bytes.cache_clear()
     _attachments_max_total_bytes.cache_clear()
@@ -77,6 +79,9 @@ def _clear_caches(monkeypatch: pytest.MonkeyPatch) -> None:
         "DISCORD_OUTBOUND_FILE_MAX_BYTES",
         "DISCORD_QUOTE_BOT_REPLIES",
         "DISCORD_REPLY_TO_BOTS",
+        "ADKLAW_KNOWLEDGE_BACKEND",
+        "ADKLAW_KNOWLEDGE_FIRESTORE_COLLECTION",
+        "ADKLAW_KNOWLEDGE_FIRESTORE_PROJECT",
         "ADKLAW_SEND_FILE_MAX_BYTES",
         "ADKLAW_WEB_SEARCH_LATLNG",
         "ADKLAW_WEB_SEARCH_MODEL",

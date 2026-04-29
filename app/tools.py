@@ -822,6 +822,103 @@ async def send_workspace_file(
     )
 
 
+async def list_knowledge() -> dict:
+    """List the slugs and one-line summaries of every entry in the
+    knowledge store. Use this to discover what durable facts you
+    have already recorded; then read the relevant ones with
+    `read_knowledge(slug)`.
+
+    Returns a list sorted by `created_at` ascending — oldest first,
+    new entries always appended."""
+    from .knowledge import get_knowledge_service
+
+    service = get_knowledge_service()
+    entries = await service.list_knowledge()
+    return _ok(
+        entries=[
+            {
+                "slug": e.slug,
+                "summary": e.summary,
+                "created_at": e.created_at.isoformat(),
+            }
+            for e in entries
+        ]
+    )
+
+
+async def read_knowledge(slug: str) -> dict:
+    """Read a single knowledge entry by its slug.
+
+    Returns the full markdown content along with the summary and
+    timestamps. Returns `status: "error"` if the slug doesn't
+    exist."""
+    from .knowledge import get_knowledge_service
+    from .knowledge.local import InvalidSlugError
+
+    service = get_knowledge_service()
+    try:
+        entry = await service.read_knowledge(slug)
+    except InvalidSlugError as e:
+        return _err(str(e))
+    if entry is None:
+        return _err(f"no knowledge entry with slug {slug!r}")
+    return _ok(
+        slug=entry.slug,
+        summary=entry.summary,
+        content=entry.content,
+        created_at=entry.created_at.isoformat(),
+        updated_at=entry.updated_at.isoformat(),
+    )
+
+
+async def write_knowledge(slug: str, summary: str, content: str) -> dict:
+    """Create or update a knowledge entry.
+
+    `slug` must match `[a-z0-9][a-z0-9_-]*` (kebab-case). It's the
+    stable identifier — pick something descriptive and short.
+
+    `summary` is a one-line description (≤120 chars recommended)
+    that goes into the prompt index every turn. Keep it stable
+    across content edits — rewriting the summary on minor changes
+    invalidates the prompt cache.
+
+    `content` is freeform markdown; pick the structure that fits
+    the fact you're recording. No required headings.
+    """
+    from .knowledge import get_knowledge_service
+    from .knowledge.local import InvalidSlugError
+
+    service = get_knowledge_service()
+    try:
+        entry = await service.write_knowledge(slug, summary, content)
+    except InvalidSlugError as e:
+        return _err(str(e))
+    except OSError as e:
+        return _err(f"failed to write knowledge entry {slug!r}: {e}")
+    return _ok(
+        slug=entry.slug,
+        summary=entry.summary,
+        created_at=entry.created_at.isoformat(),
+        updated_at=entry.updated_at.isoformat(),
+    )
+
+
+async def delete_knowledge(slug: str) -> dict:
+    """Delete a knowledge entry. Returns `status: "error"` if the
+    slug doesn't exist (so the agent can detect typos)."""
+    from .knowledge import get_knowledge_service
+    from .knowledge.local import InvalidSlugError
+
+    service = get_knowledge_service()
+    try:
+        existed = await service.delete_knowledge(slug)
+    except InvalidSlugError as e:
+        return _err(str(e))
+    if not existed:
+        return _err(f"no knowledge entry with slug {slug!r}")
+    return _ok(slug=slug)
+
+
 ALL_TOOLS = [
     read_file,
     write_file,
@@ -834,4 +931,8 @@ ALL_TOOLS = [
     web_fetch,
     web_search,
     send_workspace_file,
+    list_knowledge,
+    read_knowledge,
+    write_knowledge,
+    delete_knowledge,
 ]

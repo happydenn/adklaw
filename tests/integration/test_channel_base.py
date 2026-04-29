@@ -581,7 +581,9 @@ async def test_channel_base_with_extras_builds_app(
     )
     from google.adk.agents.readonly_context import ReadonlyContext
 
-    rendered = ch._app.root_agent.instruction(MagicMock(spec=ReadonlyContext))
+    rendered = await ch._app.root_agent.instruction(
+        MagicMock(spec=ReadonlyContext)
+    )
     assert "MARKER-FROM-CHANNEL" in rendered
 
 
