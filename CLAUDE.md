@@ -44,6 +44,27 @@ Ask the user: Option A (simple single-project) or Option B (full CI/CD pipeline 
 
 ---
 
+## Documentation
+
+The reasoning behind a non-obvious design decision is the most expensive thing to recover and the easiest thing to lose. Plans expire. Conversations get compacted. **Write durable design notes to `docs/` whenever you make a non-obvious architectural decision.**
+
+Start at `docs/architecture-overview.md` — it's the navigable index. Existing examples (`docs/channels-context.md`, `docs/channels-gateway.md`) show the voice: short narrative covering *the problem*, *what we do*, and *why* — not exhaustive API docs.
+
+When to write a doc:
+- A new abstraction or service interface lands.
+- A non-obvious tradeoff was made (e.g., "why workspace is not a backend interface").
+- A deployment-shape concern was resolved.
+- A privacy / safety / scope decision was made.
+
+When *not* to write a doc:
+- Bug fixes with self-evident reasoning.
+- Renames, refactors that don't change shape.
+- Anything already obvious from the code + commit message.
+
+**Decisions and deferrals.** When you make an architectural decision, append it to `docs/decisions-and-deferrals.md` under **Decided**. When you explicitly punt on a question rather than resolve it, append to **Deferred** with the trigger that would force a decision. When you turn down a viable-looking alternative, append to **Rejected** with the reasoning. This file is the durable record — read it before opening any "why is X built this way?" conversation.
+
+The doc lands in the same PR as the code; the PR description references it. This way the design rationale is reviewed and merged with the implementation, not deferred to a later cleanup that never happens.
+
 ## Operational Guidelines for Coding Agents
 
 - **Code preservation**: Only modify code directly targeted by the user's request. Preserve all surrounding code, config values (e.g., `model`), comments, and formatting.
