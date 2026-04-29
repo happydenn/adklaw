@@ -22,6 +22,17 @@ COPY ./pyproject.toml ./README.md ./uv.lock* ./
 
 COPY ./app ./app
 
+# Bake the workspace into the image. `templates/` is the curated
+# starter scaffold (AGENTS.md, plus any other top-level *.md the
+# operator chooses to drop in there before building). At runtime
+# the agent reads `ADKLAW_WORKSPACE` to find this; live edits to
+# the in-image workspace are ephemeral on stateless hosts (Cloud
+# Run default, Agent Runtime), so durable state belongs in
+# Firestore knowledge / GCS artifacts. See
+# `docs/deployments.md`.
+COPY ./templates ./workspace
+ENV ADKLAW_WORKSPACE=/code/workspace
+
 RUN uv sync --frozen
 
 ARG COMMIT_SHA=""
