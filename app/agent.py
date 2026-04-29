@@ -17,8 +17,10 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from google.adk.agents import Agent
+from google.adk.agents.context_cache_config import ContextCacheConfig
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.apps import App
+from google.adk.apps.app import EventsCompactionConfig
 from google.adk.models import Gemini
 from google.adk.tools.load_artifacts_tool import load_artifacts_tool
 from google.genai import types
@@ -203,7 +205,28 @@ def build_app(
         instruction=_instruction_provider_factory(extra_instruction),
         tools=[*ALL_TOOLS, load_artifacts_tool, *extra_tools, skills_toolset],
     )
-    return App(root_agent=agent, name=name)
+    return App(
+        root_agent=agent,
+        name=name,
+        # See docs/session-memory.md for the rationale behind these
+        # numbers. token_threshold sits well under Gemini 3's 1M
+        # context to leave headroom; event_retention_size keeps the
+        # tail raw so recent turns aren't summarized away.
+        events_compaction_config=EventsCompactionConfig(
+            compaction_interval=10,
+            overlap_size=3,
+            token_threshold=700_000,
+            event_retention_size=40,
+        ),
+        # min_tokens floors caching to requests where the savings
+        # exceed cache overhead — small one-shot CLI runs aren't
+        # worth caching.
+        context_cache_config=ContextCacheConfig(
+            cache_intervals=10,
+            ttl_seconds=1800,
+            min_tokens=4096,
+        ),
+    )
 
 
 # Module-level singleton for CLI / playground / Agent Runtime entry
