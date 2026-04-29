@@ -182,9 +182,6 @@ def build_app(
             retry_options=types.HttpRetryOptions(attempts=3),
         ),
         instruction=_instruction_provider_factory(extra_instruction),
-        generate_content_config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level="medium"),
-        ),
         tools=[*ALL_TOOLS, load_artifacts_tool, *extra_tools, skills_toolset],
     )
     return App(root_agent=agent, name=name)
